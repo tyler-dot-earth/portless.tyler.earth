@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { processStartTime, withTailscaleLock } from "./tailscale-lock.js";
+import { processStartTime, psStartTime, withTailscaleLock } from "./tailscale-lock.js";
 
 describe("withTailscaleLock", () => {
   let dir: string;
@@ -103,12 +103,37 @@ describe("withTailscaleLock", () => {
     expect(recorded).toBe(processStartTime(process.pid));
   });
 
-  it.skipIf(process.platform === "win32")("tells processes apart by start time", () => {
-    const started = processStartTime(process.pid);
-    expect(started).toMatch(/\S/);
-    expect(processStartTime(process.ppid)).not.toBe(started);
-    expect(processStartTime(999_999_999)).toBeUndefined();
-  });
+  it.skipIf(process.platform === "win32")(
+    "reads a start time for a live process and none for a missing one",
+    () => {
+      expect(processStartTime(process.pid)).toMatch(/\S/);
+      expect(processStartTime(999_999_999)).toBeUndefined();
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "formats ps start times alike whatever the caller's timezone and locale",
+    () => {
+      const original = { TZ: process.env.TZ, LC_ALL: process.env.LC_ALL };
+      const restore = (key: "TZ" | "LC_ALL") => {
+        if (original[key] === undefined) delete process.env[key];
+        else process.env[key] = original[key];
+      };
+      try {
+        process.env.TZ = "America/Los_Angeles";
+        process.env.LC_ALL = "de_DE.UTF-8";
+        const west = psStartTime(process.pid);
+        process.env.TZ = "Asia/Tokyo";
+        process.env.LC_ALL = "C";
+        const east = psStartTime(process.pid);
+        expect(west).toMatch(/\S/);
+        expect(east).toBe(west);
+      } finally {
+        restore("TZ");
+        restore("LC_ALL");
+      }
+    }
+  );
 
   it("takes a lock directory left by an older version only once it is stale", () => {
     fs.mkdirSync(lockPath);

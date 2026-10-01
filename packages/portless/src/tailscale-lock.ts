@@ -45,6 +45,24 @@ interface LockChecks {
 }
 
 /**
+ * When a process started according to `ps`, in a fixed timezone and locale: `lstart` is local time
+ * in the caller's format, so two processes would otherwise describe the same start differently.
+ */
+export function psStartTime(pid: number): string | undefined {
+  try {
+    const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf-8",
+      env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+    });
+    return output.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * When a process started: its boot-relative start time from `/proc` on Linux, or `ps` elsewhere.
  * Undefined when it can't be read, such as on Windows.
  */
@@ -59,16 +77,7 @@ export function processStartTime(pid: number): string | undefined {
       return undefined;
     }
   }
-  try {
-    const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 2_000,
-    });
-    return output.trim() || undefined;
-  } catch {
-    return undefined;
-  }
+  return psStartTime(pid);
 }
 
 interface LockOnDisk {
