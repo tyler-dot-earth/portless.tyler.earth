@@ -1078,6 +1078,12 @@ export function spawnCommand(
   options?: {
     env?: NodeJS.ProcessEnv;
     onCleanup?: () => void;
+    /**
+     * Runs once when shutdown begins, before waiting for the child to exit. Use it to release
+     * registrations outside portless right away: a supervisor may kill this process while the
+     * child is still stopping, and `onCleanup` would never run.
+     */
+    onShutdown?: () => void;
   }
 ): void {
   const env: Record<string, string | undefined> = {
@@ -1150,6 +1156,11 @@ export function spawnCommand(
     shutdownSignal = signal;
     if (child.pid) trackProcessTree(child.pid, trackedProcesses);
     killTree(child, signal);
+    try {
+      options?.onShutdown?.();
+    } catch {
+      // Best-effort; onCleanup still runs once the child exits
+    }
 
     graceTimer = setTimeout(() => {
       if (child.pid) trackProcessTree(child.pid, trackedProcesses);
