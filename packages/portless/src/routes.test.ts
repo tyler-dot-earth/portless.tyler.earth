@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
-import { RouteStore, RouteConflictError, holdsRegistration, routeKey } from "./routes.js";
+import { RouteStore, RouteConflictError } from "./routes.js";
 
 describe("RouteStore", () => {
   let tmpDir: string;
@@ -500,7 +500,7 @@ describe("RouteStore", () => {
       expect(routes[0].ngrokPid).toBeUndefined();
     });
   });
-  describe("stale routes that hold a registration (#280)", () => {
+  describe("stale routes that record a Tailscale registration (#280)", () => {
     const deadPid = 999999;
     const held = {
       hostname: "shared.localhost",
@@ -521,14 +521,8 @@ describe("RouteStore", () => {
       return store.loadRoutesRaw().map((r) => r.hostname);
     }
 
-    it("recognizes routes holding a Tailscale serve or ngrok tunnel", () => {
-      expect(holdsRegistration(held)).toBe(true);
-      expect(holdsRegistration({ ...plain, ngrokPid: 123 })).toBe(true);
-      expect(holdsRegistration(plain)).toBe(false);
-    });
-
-    it("keeps them on disk when cleanup persists, and drops plain stale routes", () => {
-      writeRoutes([held, plain, live]);
+    it("keeps them on disk when cleanup persists, and drops other stale routes", () => {
+      writeRoutes([held, plain, { ...plain, hostname: "ngrok.localhost", ngrokPid: 123 }, live]);
       expect(store.loadRoutes(true).map((r) => r.hostname)).toEqual(["live.localhost"]);
       expect(hostnamesOnDisk()).toEqual(["shared.localhost", "live.localhost"]);
     });
@@ -573,10 +567,18 @@ describe("RouteStore", () => {
       expect(store.pruneStaleRoutes().map((r) => r.hostname)).toEqual(["plain.localhost"]);
       expect(hostnamesOnDisk()).toEqual(["shared.localhost", "live.localhost"]);
 
-      expect(store.pruneStaleRoutes(new Set([routeKey(held)])).map((r) => r.hostname)).toEqual([
-        "shared.localhost",
-      ]);
+      // A release names the route by hostname and pid; a later owner of the hostname is not it.
+      expect(store.pruneStaleRoutes([{ ...held, pid: process.pid }])).toEqual([]);
+      expect(store.pruneStaleRoutes([held]).map((r) => r.hostname)).toEqual(["shared.localhost"]);
       expect(hostnamesOnDisk()).toEqual(["live.localhost"]);
+    });
+
+    it("updates a route only while the given pid owns it", () => {
+      writeRoutes([live]);
+      store.updateRoute("live.localhost", { tailscaleHttpsPort: 443 }, deadPid);
+      expect(store.loadRoutes()[0].tailscaleHttpsPort).toBeUndefined();
+      store.updateRoute("live.localhost", { tailscaleHttpsPort: 443 }, process.pid);
+      expect(store.loadRoutes()[0].tailscaleHttpsPort).toBe(443);
     });
   });
 });

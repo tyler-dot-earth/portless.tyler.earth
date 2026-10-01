@@ -24,14 +24,7 @@ import {
   cleanHostsFile,
   shouldAutoSyncHosts,
 } from "./hosts.js";
-import {
-  FILE_MODE,
-  holdsRegistration,
-  RouteConflictError,
-  type RouteMapping,
-  routeKey,
-  RouteStore,
-} from "./routes.js";
+import { FILE_MODE, RouteConflictError, type RouteMapping, RouteStore } from "./routes.js";
 import {
   ensureTailscaleReady,
   findAvailableServePort,
@@ -39,6 +32,7 @@ import {
   getUsedServePorts,
   registerFunnel,
   registerServe,
+  servesLocalPort,
   unregisterTailscale,
 } from "./tailscale.js";
 import { ensureNgrokAvailable, startNgrok, stopNgrok, stopNgrokProcess } from "./ngrok.js";
@@ -527,36 +521,53 @@ function addRoutes(
   return [...new Set(killedPids)];
 }
 
-/**
- * Release what a route registered outside portless: its Tailscale serve or funnel and its ngrok
- * tunnel. Returns false when the Tailscale registration could not be removed; the caller then keeps
- * the route, since it is the registration's only record (#280).
- */
-function releaseRouteRegistrations(route: RouteMapping): boolean {
-  let released = true;
-  if (route.tailscaleHttpsPort) {
-    try {
-      unregisterTailscale(route);
-    } catch {
-      released = false;
-    }
-  }
-  stopNgrok(route);
-  return released;
+type StaleTailscaleRelease = "removed" | "gone" | "failed";
+
+/** Whether two entries are the same route; a hostname can be reused by a later owner. */
+function isSameRoute(a: RouteMapping, b: RouteMapping): boolean {
+  return a.hostname === b.hostname && a.pid === b.pid;
 }
 
 /**
- * Release registrations left by sessions that died before cleaning up, then drop their routes.
- * Returns the routes released.
+ * Release the Tailscale serve or funnel a stale route records, if it is still that route's. Its run
+ * may have released it already and another app may have taken the port since, so it is only
+ * removed while no live route claims the port and Tailscale still sends it to the route's app port.
+ * "gone" means it no longer exists or belongs to someone else; "failed" means it could not be
+ * checked or removed, so the caller keeps the route, its only record (#280).
+ */
+function releaseStaleTailscale(
+  route: RouteMapping,
+  liveRoutes: readonly RouteMapping[]
+): StaleTailscaleRelease {
+  const httpsPort = route.tailscaleHttpsPort;
+  if (httpsPort === undefined) return "gone";
+  if (liveRoutes.some((live) => live.tailscaleHttpsPort === httpsPort)) return "gone";
+  try {
+    if (!servesLocalPort(httpsPort, route.port)) return "gone";
+    unregisterTailscale(route);
+    return "removed";
+  } catch {
+    return "failed";
+  }
+}
+
+/**
+ * Release Tailscale registrations recorded by sessions that died before cleaning up, then drop
+ * those routes. Returns the routes whose serve was removed.
  */
 function releaseStaleRegistrations(store: RouteStore): RouteMapping[] {
-  const releasedRoutes = store
-    .staleRoutes()
-    .filter((route) => holdsRegistration(route) && releaseRouteRegistrations(route));
-  if (releasedRoutes.length > 0) {
-    store.pruneStaleRoutes(new Set(releasedRoutes.map(routeKey)));
+  const liveRoutes = store.loadRoutes();
+  const released: RouteMapping[] = [];
+  const removed: RouteMapping[] = [];
+  for (const route of store.staleRoutes()) {
+    if (route.tailscaleHttpsPort === undefined) continue;
+    const result = releaseStaleTailscale(route, liveRoutes);
+    if (result === "failed") continue;
+    released.push(route);
+    if (result === "removed") removed.push(route);
   }
-  return releasedRoutes;
+  if (released.length > 0) store.pruneStaleRoutes(released);
+  return removed;
 }
 
 function removeRoutes(store: RouteStore, hostnames: readonly string[], ownerPid?: number): void {
@@ -1370,11 +1381,23 @@ async function runApp(
     if (tailscaleReleased || tailscaleHttpsPort === undefined) return true;
     try {
       unregisterTailscale({ tailscaleHttpsPort, tailscaleFunnel: wantsFunnel || undefined });
-      tailscaleReleased = true;
     } catch {
       // Keep the route below so `portless prune` or the next shared run can retry
+      return false;
     }
-    return tailscaleReleased;
+    tailscaleReleased = true;
+    // Forget the port now: another app may take it while this one's child is still stopping, and
+    // if this process is then killed, a leftover record must not lead recovery to that app's serve.
+    try {
+      store.updateRoute(
+        hostname,
+        { tailscaleUrl: null, tailscaleHttpsPort: null, tailscaleFunnel: null },
+        process.pid
+      );
+    } catch {
+      // Recovery also checks that the serve still targets this route before removing it
+    }
+    return true;
   };
   /** Remove this run's routes, unless they are the only record of a Tailscale registration. */
   const removeRoutesIfReleased = (): void => {
@@ -1427,13 +1450,11 @@ async function runApp(
     // run to the next free port. Release those first.
     try {
       for (const stale of releaseStaleRegistrations(store)) {
-        if (stale.tailscaleHttpsPort) {
-          console.log(
-            colors.dim(
-              `  Released a stale Tailscale serve on port ${stale.tailscaleHttpsPort} (${stale.hostname}).`
-            )
-          );
-        }
+        console.log(
+          colors.dim(
+            `  Released a stale Tailscale serve on port ${stale.tailscaleHttpsPort} (${stale.hostname}).`
+          )
+        );
       }
     } catch {
       // Lock contention or a missing CLI; registration below still works
@@ -1842,7 +1863,7 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless doctor")}                  Check local portless health
   ${colors.cyan("portless trust")}                   Add local CA to system trust store
   ${colors.cyan("portless clean")}                   Remove portless state, trust entry, and hosts block
-  ${colors.cyan("portless prune")}                   Kill orphaned dev servers from crashed sessions
+  ${colors.cyan("portless prune")}                   Kill orphaned dev servers and Tailscale serves from crashed sessions
   ${colors.cyan("portless hosts sync")}              Add routes to ${HOSTS_DISPLAY} (fixes Safari)
   ${colors.cyan("portless hosts clean")}             Remove portless entries from ${HOSTS_DISPLAY}
 
@@ -2196,6 +2217,11 @@ may survive and continue holding their ports. This command finds those orphans
 by checking routes whose owning CLI process is dead but whose port is still in
 use, then terminates them and cleans up the stale route entries.
 
+It also removes Tailscale serves those sessions left registered, but only while
+a serve still points at the crashed app. If a serve can't be removed (for
+example, when the tailscale CLI is missing), its route is kept so the next
+prune can retry.
+
 ${colors.bold("Usage:")}
   ${colors.cyan("portless prune")}
   ${colors.cyan("portless prune --force")}     Send SIGKILL instead of SIGTERM
@@ -2214,12 +2240,21 @@ ${colors.bold("Options:")}
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
 
-  // Release registrations before removing routes: a stale route is the only record of its
-  // Tailscale serve, so one whose release fails stays for the next prune to retry (#280).
-  const released = new Set<string>();
-  for (const route of store.staleRoutes()) {
-    if (!holdsRegistration(route)) continue;
-    if (!releaseRouteRegistrations(route)) {
+  // A stale route is the only record of its Tailscale serve, so release that before removing
+  // routes, and keep any route whose serve could not be released for the next prune (#280).
+  const stale = store.staleRoutes();
+  if (stale.length === 0) {
+    console.log("No orphaned routes found.");
+    return;
+  }
+  const liveRoutes = store.loadRoutes();
+  const released: RouteMapping[] = [];
+  let keptCount = 0;
+  for (const route of stale) {
+    if (route.tailscaleHttpsPort === undefined) continue;
+    const result = releaseStaleTailscale(route, liveRoutes);
+    if (result === "failed") {
+      keptCount++;
       console.warn(
         colors.yellow(
           `  ${route.hostname} - could not remove tailscale serve on port ${route.tailscaleHttpsPort}; keeping its route to retry`
@@ -2227,28 +2262,45 @@ ${colors.bold("Options:")}
       );
       continue;
     }
-    released.add(routeKey(route));
-    if (route.tailscaleHttpsPort) {
-      console.log(
-        `  ${route.hostname} - removed tailscale serve on port ${route.tailscaleHttpsPort}`
-      );
-    }
+    released.push(route);
+    console.log(
+      result === "removed"
+        ? `  ${route.hostname} - removed tailscale serve on port ${route.tailscaleHttpsPort}`
+        : `  ${route.hostname} - tailscale serve on port ${route.tailscaleHttpsPort} already removed`
+    );
+  }
+
+  const removed = store.pruneStaleRoutes(released);
+  for (const route of removed) {
     if (route.ngrokPid) {
+      stopNgrok(route);
       console.log(`  ${route.hostname} - stopped ngrok tunnel`);
     }
   }
 
-  const stale = store.pruneStaleRoutes(released);
-  if (stale.length === 0) {
-    console.log("No orphaned routes found.");
-    return;
-  }
-
+  // Kill orphaned dev servers for every stale route, including those kept to retry, but never on a
+  // port a live route now uses.
+  const livePorts = new Set(liveRoutes.map((route) => route.port));
+  const orphanCandidates = [
+    ...stale,
+    ...removed.filter((route) => !stale.some((s) => isSameRoute(s, route))),
+  ];
   let killed = 0;
-  for (const route of stale) {
+  for (const route of orphanCandidates) {
+    const isRemoved = removed.some((r) => isSameRoute(r, route));
+    if (livePorts.has(route.port)) {
+      if (isRemoved) {
+        console.log(
+          `  ${route.hostname} :${route.port} - route removed (port now used by a live app)`
+        );
+      }
+      continue;
+    }
     const pids = findPidsOnPort(route.port);
     if (pids.length === 0) {
-      console.log(`  ${route.hostname} :${route.port} - route removed (port already free)`);
+      if (isRemoved) {
+        console.log(`  ${route.hostname} :${route.port} - route removed (port already free)`);
+      }
       continue;
     }
     const signal = forceKill ? "SIGKILL" : "SIGTERM";
@@ -2263,13 +2315,21 @@ ${colors.bold("Options:")}
     }
   }
 
-  const routeWord = stale.length === 1 ? "route" : "routes";
+  const routeWord = removed.length === 1 ? "route" : "routes";
   const procWord = killed === 1 ? "process" : "processes";
   console.log(
     colors.green(
-      `\nPruned ${stale.length} stale ${routeWord}, killed ${killed} orphaned ${procWord}.`
+      `\nPruned ${removed.length} stale ${routeWord}, killed ${killed} orphaned ${procWord}.`
     )
   );
+  if (keptCount > 0) {
+    const keptWord = keptCount === 1 ? "route" : "routes";
+    console.warn(
+      colors.yellow(
+        `Kept ${keptCount} ${keptWord} whose Tailscale serve could not be removed. Run \`portless prune\` again to retry.`
+      )
+    );
+  }
 }
 
 async function handleList(): Promise<void> {

@@ -356,7 +356,7 @@ portless myapp --funnel next dev
 
 Tailscale HTTPS certificates must be enabled before `--tailscale` or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
 
-Set `PORTLESS_TAILSCALE=1` in your shell profile or `.env` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up automatically when the app exits.
+Set `PORTLESS_TAILSCALE=1` in your shell profile or `.env` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are removed as soon as the app starts shutting down. If that fails, or portless is killed first, the route is kept so `portless prune` or the next shared app can remove the serve later, as long as it still points at that app.
 
 Requires the Tailscale CLI to be installed and connected (`tailscale up`), with Tailscale HTTPS certificates enabled.
 
@@ -388,7 +388,7 @@ portless list                    # Show active routes
 portless doctor                  # Check proxy, routes, DNS, and CA trust
 portless trust                   # Add local CA to system trust store
 portless clean                   # Remove state, CA trust entry, and hosts block
-portless prune                   # Kill orphaned dev servers from crashed sessions
+portless prune                   # Kill orphaned dev servers and Tailscale serves from crashed sessions
 portless hosts sync              # Add routes to /etc/hosts (fixes Safari)
 portless hosts clean             # Remove portless entries from /etc/hosts
 
