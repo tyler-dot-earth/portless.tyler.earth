@@ -86,7 +86,6 @@ export class RouteStore {
   readonly dir: string;
   private readonly routesPath: string;
   private readonly lockPath: string;
-  private readonly tailscaleLockPath: string;
   readonly pidPath: string;
   readonly portFilePath: string;
   private readonly onWarning: ((message: string) => void) | undefined;
@@ -95,7 +94,6 @@ export class RouteStore {
     this.dir = dir;
     this.routesPath = path.join(dir, "routes.json");
     this.lockPath = path.join(dir, "routes.lock");
-    this.tailscaleLockPath = path.join(dir, "tailscale.lock");
     this.pidPath = path.join(dir, "proxy.pid");
     this.portFilePath = path.join(dir, "proxy.port");
     this.onWarning = options?.onWarning;
@@ -126,20 +124,20 @@ export class RouteStore {
     Atomics.wait(RouteStore.sleepBuffer, 0, 0, ms);
   }
 
-  private acquireLock(lockPath = this.lockPath): boolean {
+  private acquireLock(): boolean {
     const deadline = Date.now() + LOCK_TIMEOUT_MS;
     let delay = LOCK_RETRY_BASE_MS;
 
     while (Date.now() < deadline) {
       try {
-        fs.mkdirSync(lockPath);
+        fs.mkdirSync(this.lockPath);
         return true;
       } catch (err: unknown) {
         if (isErrnoException(err) && err.code === "EEXIST") {
           try {
-            const stat = fs.statSync(lockPath);
+            const stat = fs.statSync(this.lockPath);
             if (Date.now() - stat.mtimeMs > STALE_LOCK_THRESHOLD_MS) {
-              fs.rmSync(lockPath, { recursive: true });
+              fs.rmSync(this.lockPath, { recursive: true });
               continue;
             }
           } catch {
@@ -156,30 +154,11 @@ export class RouteStore {
     return false;
   }
 
-  private releaseLock(lockPath = this.lockPath): void {
+  private releaseLock(): void {
     try {
-      fs.rmSync(lockPath, { recursive: true });
+      fs.rmSync(this.lockPath, { recursive: true });
     } catch {
       // Lock may already be removed; non-fatal
-    }
-  }
-
-  /**
-   * Run `fn` while holding the Tailscale lock. Releasing a stale route's registration checks
-   * Tailscale and then removes the serve, and registering a serve is followed by recording it on
-   * a route; holding this lock for both keeps another process from registering between the check
-   * and the removal, or checking between the registration and the record (#280). Takes the route
-   * lock only inside `fn`, never the other way around. Throws when the lock can't be acquired.
-   */
-  withTailscaleLock<T>(fn: () => T): T {
-    this.ensureDir();
-    if (!this.acquireLock(this.tailscaleLockPath)) {
-      throw new Error("Failed to acquire Tailscale lock");
-    }
-    try {
-      return fn();
-    } finally {
-      this.releaseLock(this.tailscaleLockPath);
     }
   }
 

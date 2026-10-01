@@ -16,10 +16,15 @@ const PROXY_PORT = 19014;
 
 const isWindows = process.platform === "win32";
 
-// The stand-in answers `serve status` from the config as it was when called, and applies a change
-// to the config as it is when the change lands. FAKE_TAILSCALE_DELAY_MS delays every answer, like
-// the real CLI; FAKE_TAILSCALE_STATUS_DELAY_MS delays status answers further, and
-// FAKE_TAILSCALE_OFF_DELAY_MS delays a removal before it lands.
+// The stand-in keeps its serve config in a JSON file. FAKE_TAILSCALE_DELAY_MS delays every answer,
+// like the real CLI. Tests coordinate apps through FAKE_TAILSCALE_SYNC, a shared directory, and
+// FAKE_TAILSCALE_APP, the calling app's name:
+// - FAKE_TAILSCALE_BARRIER=N holds an app's first `serve status` until N apps have called the CLI
+//   at all (they do before taking any lock), then until they have all made their first `serve
+//   status` too (or 3 more seconds pass), so they all read the config before any of them changes it.
+// - FAKE_TAILSCALE_HOLD=1 holds an app's first `serve status` until a "release" file appears.
+// - FAKE_TAILSCALE_OFF_AFTER_REGISTER=1 holds a removal until another app has registered that port
+//   (or 3 seconds pass).
 const FAKE_TAILSCALE = `#!${process.execPath}
 const fs = require("node:fs");
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(ms) || 0);
@@ -29,7 +34,24 @@ const write = (serves) => fs.writeFileSync(statePath, JSON.stringify(serves));
 const args = process.argv.slice(2);
 const command = args.join(" ");
 const https = (args.find((arg) => arg.startsWith("--https=")) || "").slice("--https=".length);
+const sync = process.env.FAKE_TAILSCALE_SYNC;
+const app = process.env.FAKE_TAILSCALE_APP;
+const waitFor = (done, ms) => {
+  const deadline = Date.now() + ms;
+  while (!done() && Date.now() < deadline) sleep(20);
+};
 fs.appendFileSync(process.env.FAKE_TAILSCALE_LOG, command + "\\n");
+const markers = (prefix) => fs.readdirSync(sync).filter((f) => f.startsWith(prefix)).length;
+if (sync && app) fs.writeFileSync(sync + "/started-" + app, "");
+if (command === "serve status --json" && sync && app && !fs.existsSync(sync + "/status-" + app)) {
+  fs.writeFileSync(sync + "/status-" + app, "");
+  if (process.env.FAKE_TAILSCALE_HOLD === "1") waitFor(() => fs.existsSync(sync + "/release"), 60000);
+  const count = Number(process.env.FAKE_TAILSCALE_BARRIER) || 0;
+  if (count > 0) {
+    waitFor(() => markers("started-") >= count, 20000);
+    waitFor(() => markers("status-") >= count, 3000);
+  }
+}
 let output = "";
 let failure = "";
 if (command === "version") {
@@ -42,9 +64,11 @@ if (command === "version") {
     Web["host.example.ts.net:" + port] = { Handlers: { "/": { Proxy: target } } };
   }
   output = JSON.stringify({ Web });
-  sleep(process.env.FAKE_TAILSCALE_STATUS_DELAY_MS);
 } else if (args[0] === "serve" && args[args.length - 1] === "off") {
-  sleep(process.env.FAKE_TAILSCALE_OFF_DELAY_MS);
+  if (process.env.FAKE_TAILSCALE_OFF_AFTER_REGISTER === "1") {
+    const before = read()[https];
+    waitFor(() => read()[https] !== undefined && read()[https] !== before, 3000);
+  }
   const serves = read();
   if (process.env.FAKE_TAILSCALE_FAIL_OFF === "1") {
     failure = "interrupted";
@@ -178,6 +202,7 @@ describe.skipIf(isWindows)("Tailscale cleanup (#280)", () => {
       binDir: path.join(tmpRoot, "bin"),
       serves: path.join(tmpRoot, "serves.json"),
       log: path.join(tmpRoot, "tailscale.log"),
+      sync: path.join(tmpRoot, "sync"),
     };
   }
 
@@ -191,6 +216,7 @@ describe.skipIf(isWindows)("Tailscale cleanup (#280)", () => {
       PORTLESS_STATE_DIR: p.stateDir,
       FAKE_TAILSCALE_STATE: p.serves,
       FAKE_TAILSCALE_LOG: p.log,
+      FAKE_TAILSCALE_SYNC: p.sync,
       NO_COLOR: "1",
       ...extra,
     };
@@ -231,6 +257,7 @@ describe.skipIf(isWindows)("Tailscale cleanup (#280)", () => {
     const p = paths();
     fs.mkdirSync(p.stateDir);
     fs.mkdirSync(p.binDir);
+    fs.mkdirSync(p.sync);
     fs.writeFileSync(path.join(p.binDir, "tailscale"), FAKE_TAILSCALE, { mode: 0o755 });
     if (initial.routes) {
       fs.writeFileSync(path.join(p.stateDir, "routes.json"), JSON.stringify(initial.routes));
@@ -247,7 +274,12 @@ describe.skipIf(isWindows)("Tailscale cleanup (#280)", () => {
   function spawnSharedApp(appName: string, script: string, extra: NodeJS.ProcessEnv = {}) {
     const child = spawn(process.execPath, [CLI_PATH, appName, "node", script], {
       cwd: FIXTURE_DIR,
-      env: env({ ...extra, PORTLESS_TAILSCALE: "1", APP_NAME: appName }),
+      env: env({
+        ...extra,
+        PORTLESS_TAILSCALE: "1",
+        APP_NAME: appName,
+        FAKE_TAILSCALE_APP: appName,
+      }),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";
@@ -344,34 +376,75 @@ describe.skipIf(isWindows)("Tailscale cleanup (#280)", () => {
     expect(routeFor("ts-retry.localhost")).toBeUndefined();
   });
 
-  it("lets only one of two apps starting together release a stale serve", async () => {
-    // A dead session's serve on 443 that both apps find. Both read it before either removes it,
-    // and the second app's removal lands late, after the first has registered on 443.
-    const stale = {
-      hostname: "ts-dead.localhost",
-      port: 4987,
-      pid: 999999,
-      tailscaleUrl: "https://host.example.ts.net",
-      tailscaleHttpsPort: 443,
-    };
-    setUp({ routes: [stale], serves: { "443": "http://127.0.0.1:4987" } });
-    const slowStatus = { FAKE_TAILSCALE_STATUS_DELAY_MS: "800" };
-    const first = spawnSharedApp("ts-first", "server.js", slowStatus);
-    const second = spawnSharedApp("ts-second", "server.js", {
-      ...slowStatus,
-      FAKE_TAILSCALE_OFF_DELAY_MS: "2000",
-    });
-    const shared = [
-      await waitForSharedApp("ts-first", first.output),
-      await waitForSharedApp("ts-second", second.output),
-    ];
+  /** A dead session's serve on 443 that each test's apps find. */
+  const deadSession = {
+    routes: [
+      {
+        hostname: "ts-dead.localhost",
+        port: 4987,
+        pid: 999999,
+        tailscaleUrl: "https://host.example.ts.net",
+        tailscaleHttpsPort: 443,
+      },
+    ],
+    serves: { "443": "http://127.0.0.1:4987" },
+  };
 
-    // Each app's port is served to that app, and neither claims the other's.
+  /** Each app's port is served to that app, and no two apps claim the same port. */
+  function expectOwnServes(shared: RouteOnDisk[]): void {
     const config = serves();
     for (const route of shared) {
       expect(config[String(route.tailscaleHttpsPort)]).toBe(`http://127.0.0.1:${route.port}`);
     }
-    expect(shared[0].tailscaleHttpsPort).not.toBe(shared[1].tailscaleHttpsPort);
+    expect(new Set(shared.map((route) => route.tailscaleHttpsPort)).size).toBe(shared.length);
     expect(routeFor("ts-dead.localhost")).toBeUndefined();
+  }
+
+  it("lets only one of two apps starting together release a stale serve", async () => {
+    setUp(deadSession);
+    // Without the lock, both apps read the dead serve, and the second app's removal lands after
+    // the first has registered its own serve on 443. The second app starts once the first is at
+    // the barrier, past reading the routes, so the two never read and write routes.json at once.
+    const barrier = { FAKE_TAILSCALE_BARRIER: "2" };
+    const first = spawnSharedApp("ts-first", "server.js", barrier);
+    expect(
+      await waitUntilAsync(
+        () => Promise.resolve(fs.existsSync(path.join(paths().sync, "status-ts-first"))),
+        30_000
+      ),
+      first.output()
+    ).toBe(true);
+    const second = spawnSharedApp("ts-second", "server.js", {
+      ...barrier,
+      FAKE_TAILSCALE_OFF_AFTER_REGISTER: "1",
+    });
+    expectOwnServes([
+      await waitForSharedApp("ts-first", first.output),
+      await waitForSharedApp("ts-second", second.output),
+    ]);
   });
+
+  it("keeps the lock while its holder waits on a slow tailscale command", async () => {
+    setUp(deadSession);
+    // The first app stalls in its first status read while holding the lock, longer than the
+    // route lock's 10-second staleness, and the second app must keep waiting rather than take it.
+    const holder = spawnSharedApp("ts-holder", "server.js", { FAKE_TAILSCALE_HOLD: "1" });
+    expect(
+      await waitUntilAsync(
+        () => Promise.resolve(fs.existsSync(path.join(paths().sync, "status-ts-holder"))),
+        30_000
+      ),
+      holder.output()
+    ).toBe(true);
+    const waiter = spawnSharedApp("ts-waiter", "server.js");
+    await sleep(11_000);
+    expect(routeFor("ts-waiter.localhost")?.tailscaleHttpsPort).toBeUndefined();
+    expect(serves()).toEqual(deadSession.serves);
+
+    fs.writeFileSync(path.join(paths().sync, "release"), "");
+    expectOwnServes([
+      await waitForSharedApp("ts-holder", holder.output),
+      await waitForSharedApp("ts-waiter", waiter.output),
+    ]);
+  }, 60_000);
 });
