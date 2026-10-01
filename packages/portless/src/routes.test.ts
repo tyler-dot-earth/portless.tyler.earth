@@ -568,9 +568,35 @@ describe("RouteStore", () => {
       expect(hostnamesOnDisk()).toEqual(["shared.localhost", "live.localhost"]);
 
       // A release names the route by hostname and pid; a later owner of the hostname is not it.
-      expect(store.pruneStaleRoutes([{ ...held, pid: process.pid }])).toEqual([]);
-      expect(store.pruneStaleRoutes([held]).map((r) => r.hostname)).toEqual(["shared.localhost"]);
+      expect(store.pruneStaleRoutes({ released: [{ ...held, pid: process.pid }] })).toEqual([]);
+      expect(store.pruneStaleRoutes({ released: [held] }).map((r) => r.hostname)).toEqual([
+        "shared.localhost",
+      ]);
       expect(hostnamesOnDisk()).toEqual(["live.localhost"]);
+    });
+
+    it("drops the ngrok fields of a kept route only once its tunnel was stopped", () => {
+      const both = { ...held, ngrokPid: 123, ngrokUrl: "https://example.ngrok.app" };
+      writeRoutes([both]);
+      store.pruneStaleRoutes();
+      expect(store.loadRoutesRaw()[0].ngrokPid).toBe(123);
+
+      expect(store.pruneStaleRoutes({ ngrokStopped: [both] })).toEqual([]);
+      const [kept] = store.loadRoutesRaw();
+      expect(kept.tailscaleHttpsPort).toBe(443);
+      expect(kept.ngrokPid).toBeUndefined();
+      expect(kept.ngrokUrl).toBeUndefined();
+    });
+
+    it("runs work under the Tailscale lock and releases it even when the work throws", () => {
+      expect(store.withTailscaleLock(() => 42)).toBe(42);
+      expect(() =>
+        store.withTailscaleLock(() => {
+          throw new Error("boom");
+        })
+      ).toThrow("boom");
+      expect(fs.existsSync(path.join(store.dir, "tailscale.lock"))).toBe(false);
+      expect(store.withTailscaleLock(() => "again")).toBe("again");
     });
 
     it("updates a route only while the given pid owns it", () => {

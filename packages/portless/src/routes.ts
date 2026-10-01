@@ -86,6 +86,7 @@ export class RouteStore {
   readonly dir: string;
   private readonly routesPath: string;
   private readonly lockPath: string;
+  private readonly tailscaleLockPath: string;
   readonly pidPath: string;
   readonly portFilePath: string;
   private readonly onWarning: ((message: string) => void) | undefined;
@@ -94,6 +95,7 @@ export class RouteStore {
     this.dir = dir;
     this.routesPath = path.join(dir, "routes.json");
     this.lockPath = path.join(dir, "routes.lock");
+    this.tailscaleLockPath = path.join(dir, "tailscale.lock");
     this.pidPath = path.join(dir, "proxy.pid");
     this.portFilePath = path.join(dir, "proxy.port");
     this.onWarning = options?.onWarning;
@@ -124,20 +126,20 @@ export class RouteStore {
     Atomics.wait(RouteStore.sleepBuffer, 0, 0, ms);
   }
 
-  private acquireLock(): boolean {
+  private acquireLock(lockPath = this.lockPath): boolean {
     const deadline = Date.now() + LOCK_TIMEOUT_MS;
     let delay = LOCK_RETRY_BASE_MS;
 
     while (Date.now() < deadline) {
       try {
-        fs.mkdirSync(this.lockPath);
+        fs.mkdirSync(lockPath);
         return true;
       } catch (err: unknown) {
         if (isErrnoException(err) && err.code === "EEXIST") {
           try {
-            const stat = fs.statSync(this.lockPath);
+            const stat = fs.statSync(lockPath);
             if (Date.now() - stat.mtimeMs > STALE_LOCK_THRESHOLD_MS) {
-              fs.rmSync(this.lockPath, { recursive: true });
+              fs.rmSync(lockPath, { recursive: true });
               continue;
             }
           } catch {
@@ -154,11 +156,30 @@ export class RouteStore {
     return false;
   }
 
-  private releaseLock(): void {
+  private releaseLock(lockPath = this.lockPath): void {
     try {
-      fs.rmSync(this.lockPath, { recursive: true });
+      fs.rmSync(lockPath, { recursive: true });
     } catch {
       // Lock may already be removed; non-fatal
+    }
+  }
+
+  /**
+   * Run `fn` while holding the Tailscale lock. Releasing a stale route's registration checks
+   * Tailscale and then removes the serve, and registering a serve is followed by recording it on
+   * a route; holding this lock for both keeps another process from registering between the check
+   * and the removal, or checking between the registration and the record (#280). Takes the route
+   * lock only inside `fn`, never the other way around. Throws when the lock can't be acquired.
+   */
+  withTailscaleLock<T>(fn: () => T): T {
+    this.ensureDir();
+    if (!this.acquireLock(this.tailscaleLockPath)) {
+      throw new Error("Failed to acquire Tailscale lock");
+    }
+    try {
+      return fn();
+    } finally {
+      this.releaseLock(this.tailscaleLockPath);
     }
   }
 
@@ -316,9 +337,17 @@ export class RouteStore {
   /**
    * Remove stale routes and return them. A stale route that records a Tailscale registration is
    * kept unless it is in `released` (same hostname and pid), so the registration keeps a record
-   * until someone releases it; dropping it would orphan the registration for good (#280).
+   * until someone releases it; dropping it would orphan the registration for good (#280). Kept
+   * routes in `ngrokStopped`, whose tunnels the caller has stopped, drop their ngrok fields so a
+   * later prune can't signal a reused PID.
    */
-  pruneStaleRoutes(released: readonly RouteMapping[] = []): RouteMapping[] {
+  pruneStaleRoutes(
+    options: { released?: readonly RouteMapping[]; ngrokStopped?: readonly RouteMapping[] } = {}
+  ): RouteMapping[] {
+    const released = options.released ?? [];
+    const ngrokStopped = options.ngrokStopped ?? [];
+    const isIn = (routes: readonly RouteMapping[], r: RouteMapping): boolean =>
+      routes.some((route) => route.hostname === r.hostname && route.pid === r.pid);
     this.ensureDir();
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
@@ -327,18 +356,20 @@ export class RouteStore {
       const all = this.loadRoutesRaw();
       const kept: RouteMapping[] = [];
       const stale: RouteMapping[] = [];
+      let forgotNgrok = false;
       for (const r of all) {
         const isStale = r.pid !== 0 && !this.isProcessAlive(r.pid);
-        const isReleased = released.some(
-          (route) => route.hostname === r.hostname && route.pid === r.pid
-        );
-        if (isStale && (!holdsTailscaleRegistration(r) || isReleased)) {
+        if (isStale && (!holdsTailscaleRegistration(r) || isIn(released, r))) {
           stale.push(r);
+        } else if (isStale && r.ngrokPid !== undefined && isIn(ngrokStopped, r)) {
+          const { ngrokPid: _pid, ngrokUrl: _url, ...withoutNgrok } = r;
+          kept.push(withoutNgrok);
+          forgotNgrok = true;
         } else {
           kept.push(r);
         }
       }
-      if (stale.length > 0) {
+      if (stale.length > 0 || forgotNgrok) {
         this.saveRoutes(kept);
       }
       return stale;
