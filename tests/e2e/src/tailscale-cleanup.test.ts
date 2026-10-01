@@ -43,6 +43,8 @@ const waitFor = (done, ms) => {
 fs.appendFileSync(process.env.FAKE_TAILSCALE_LOG, command + "\\n");
 const markers = (prefix) => fs.readdirSync(sync).filter((f) => f.startsWith(prefix)).length;
 if (sync && app) fs.writeFileSync(sync + "/started-" + app, "");
+// A status answer reflects the config before this app announces it reached the barrier.
+const statusSnapshot = command === "serve status --json" ? read() : {};
 if (command === "serve status --json" && sync && app && !fs.existsSync(sync + "/status-" + app)) {
   fs.writeFileSync(sync + "/status-" + app, "");
   if (process.env.FAKE_TAILSCALE_HOLD === "1") waitFor(() => fs.existsSync(sync + "/release"), 60000);
@@ -60,7 +62,7 @@ if (command === "version") {
   output = JSON.stringify({ Self: { DNSName: "host.example.ts.net.", Capabilities: ["https"] } });
 } else if (command === "serve status --json") {
   const Web = {};
-  for (const [port, target] of Object.entries(read())) {
+  for (const [port, target] of Object.entries(statusSnapshot)) {
     Web["host.example.ts.net:" + port] = { Handlers: { "/": { Proxy: target } } };
   }
   output = JSON.stringify({ Web });
@@ -438,6 +440,14 @@ describe.skipIf(isWindows)("Tailscale cleanup (#280)", () => {
     ).toBe(true);
     const waiter = spawnSharedApp("ts-waiter", "server.js");
     await sleep(11_000);
+    expect(routeFor("ts-waiter.localhost")?.tailscaleHttpsPort).toBeUndefined();
+    expect(serves()).toEqual(deadSession.serves);
+
+    // However old the lock looks, it stays with its live holder.
+    const lockPath = path.join(paths().stateDir, "tailscale.lock");
+    const anHourAgo = new Date(Date.now() - 60 * 60_000);
+    fs.utimesSync(lockPath, anHourAgo, anHourAgo);
+    await sleep(2_000);
     expect(routeFor("ts-waiter.localhost")?.tailscaleHttpsPort).toBeUndefined();
     expect(serves()).toEqual(deadSession.serves);
 
