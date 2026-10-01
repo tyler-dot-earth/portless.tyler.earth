@@ -252,7 +252,7 @@ portless myapp --funnel next dev
 
 Tailscale HTTPS certificates must be enabled before `--tailscale` or `--funnel` can register HTTPS URLs. Funnel must also be enabled for the tailnet and node before `--funnel` can register the public URL. If either setting is missing, portless exits before starting the child process.
 
-Each `--tailscale` app is root-mounted on its own Tailscale HTTPS port (443, then 8443, 8444, etc.) so no framework `basePath` configuration is needed. Set `PORTLESS_TAILSCALE=1` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are cleaned up when the app exits. Requires `tailscale` CLI installed and connected, with Tailscale HTTPS certificates enabled.
+Each `--tailscale` app is root-mounted on its own Tailscale HTTPS port (443, then 8443, 8444, etc.) so no framework `basePath` configuration is needed. Set `PORTLESS_TAILSCALE=1` to share every app by default. `portless list` shows both local and tailnet URLs. Tailscale serve registrations are removed as soon as the app starts shutting down. If that fails, or portless is killed first, the route is kept so `portless prune` or the next shared app can remove the serve later, as long as it still points at that app. Requires `tailscale` CLI installed and connected, with Tailscale HTTPS certificates enabled.
 
 ### ngrok sharing
 
@@ -299,7 +299,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 | `portless doctor`                                 | Check proxy, routes, DNS, CA trust, and LAN prerequisites      |
 | `portless trust`                                  | Add local CA to system trust store (for HTTPS)                 |
 | `portless clean`                                  | Remove state, CA trust entry, and /etc/hosts block             |
-| `portless prune`                                  | Kill orphaned dev servers from crashed sessions                |
+| `portless prune`                                  | Kill orphaned dev servers and Tailscale serves from crashes    |
 | `portless prune --force`                          | Kill orphans with SIGKILL instead of SIGTERM                   |
 | `portless proxy start`                            | Start HTTPS proxy as a daemon (port 443, auto-elevates)        |
 | `portless proxy start --no-tls`                   | Start without HTTPS (plain HTTP on port 80)                    |

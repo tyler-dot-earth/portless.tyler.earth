@@ -31,17 +31,12 @@ export interface RouteMapping extends RouteInfo {
 }
 
 /**
- * Whether a route still records something outside portless that only it can release: a Tailscale
- * serve or funnel, or an ngrok tunnel. Such a route is the only record of the registration, so it
- * must not be dropped until the registration is released, even after its owner has died (#280).
+ * Whether a route records a Tailscale serve or funnel. The route is the registration's only record,
+ * so it must not be dropped until the registration is released, even after its owner has died
+ * (#280).
  */
-export function holdsRegistration(route: RouteMapping): boolean {
-  return route.tailscaleHttpsPort !== undefined || route.ngrokPid !== undefined;
-}
-
-/** Identifies one route entry; a hostname can be reused by a later owner. */
-export function routeKey(route: Pick<RouteMapping, "hostname" | "pid">): string {
-  return `${route.hostname}@${route.pid}`;
+function holdsTailscaleRegistration(route: RouteMapping): boolean {
+  return route.tailscaleHttpsPort !== undefined;
 }
 
 type RouteMetadataPatch = {
@@ -207,10 +202,10 @@ export class RouteStore {
       const alive = routes.filter((r) => r.pid === 0 || this.isProcessAlive(r.pid));
       if (persistCleanup && alive.length !== routes.length) {
         // Persist the cleaned-up list so stale entries don't accumulate, but keep stale entries
-        // that still hold a registration: they are its only record, and `portless prune` (or the
-        // next shared run) releases them. Only safe when caller holds the lock.
+        // that still record a Tailscale registration: they are its only record, and `portless
+        // prune` (or the next shared run) releases them. Only safe when caller holds the lock.
         const kept = routes.filter(
-          (r) => r.pid === 0 || this.isProcessAlive(r.pid) || holdsRegistration(r)
+          (r) => r.pid === 0 || this.isProcessAlive(r.pid) || holdsTailscaleRegistration(r)
         );
         if (kept.length !== routes.length) {
           try {
@@ -229,12 +224,12 @@ export class RouteStore {
   }
 
   /**
-   * Stale routes that still hold a registration, which writers carry over unchanged. Only safe
-   * when the caller holds the lock.
+   * Stale routes that still record a Tailscale registration, which writers carry over unchanged.
+   * Only safe when the caller holds the lock.
    */
   private heldStaleRoutes(): RouteMapping[] {
     return this.loadRoutesRaw().filter(
-      (r) => r.pid !== 0 && !this.isProcessAlive(r.pid) && holdsRegistration(r)
+      (r) => r.pid !== 0 && !this.isProcessAlive(r.pid) && holdsTailscaleRegistration(r)
     );
   }
 
@@ -312,18 +307,18 @@ export class RouteStore {
 
   /**
    * Stale routes (owner no longer alive), read without changing anything. `portless prune` uses
-   * them to release registrations before removing routes.
+   * them to release Tailscale registrations before removing routes.
    */
   staleRoutes(): RouteMapping[] {
     return this.loadRoutesRaw().filter((r) => r.pid !== 0 && !this.isProcessAlive(r.pid));
   }
 
   /**
-   * Remove stale routes and return them. A stale route that still holds a registration is kept
-   * unless its key is in `released`, so the registration keeps a record until someone releases
-   * it; dropping it would orphan the registration for good (#280).
+   * Remove stale routes and return them. A stale route that records a Tailscale registration is
+   * kept unless it is in `released` (same hostname and pid), so the registration keeps a record
+   * until someone releases it; dropping it would orphan the registration for good (#280).
    */
-  pruneStaleRoutes(released: ReadonlySet<string> = new Set()): RouteMapping[] {
+  pruneStaleRoutes(released: readonly RouteMapping[] = []): RouteMapping[] {
     this.ensureDir();
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
@@ -334,7 +329,10 @@ export class RouteStore {
       const stale: RouteMapping[] = [];
       for (const r of all) {
         const isStale = r.pid !== 0 && !this.isProcessAlive(r.pid);
-        if (isStale && (!holdsRegistration(r) || released.has(routeKey(r)))) {
+        const isReleased = released.some(
+          (route) => route.hostname === r.hostname && route.pid === r.pid
+        );
+        if (isStale && (!holdsTailscaleRegistration(r) || isReleased)) {
           stale.push(r);
         } else {
           kept.push(r);
@@ -351,9 +349,10 @@ export class RouteStore {
 
   /**
    * Update metadata on an existing route entry. Only provided fields are
-   * merged; the route must already exist (matched by hostname).
+   * merged; the route must already exist (matched by hostname). When
+   * `ownerPid` is provided, the entry is only updated while that pid owns it.
    */
-  updateRoute(hostname: string, fields: RouteMetadataPatch): void {
+  updateRoute(hostname: string, fields: RouteMetadataPatch, ownerPid?: number): void {
     this.ensureDir();
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
@@ -361,7 +360,7 @@ export class RouteStore {
     try {
       const routes = this.loadRoutes(true);
       const route = routes.find((r) => r.hostname === hostname);
-      if (!route) return;
+      if (!route || (ownerPid !== undefined && route.pid !== ownerPid)) return;
       if ("tailscaleUrl" in fields) {
         if (fields.tailscaleUrl === null) delete route.tailscaleUrl;
         else if (fields.tailscaleUrl !== undefined) route.tailscaleUrl = fields.tailscaleUrl;

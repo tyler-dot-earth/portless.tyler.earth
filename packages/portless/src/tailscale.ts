@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
 
 const TAILSCALE_BINARY = "tailscale";
+const TAILSCALE_NOT_FOUND =
+  "Tailscale CLI not found. Install Tailscale (https://tailscale.com/download) and ensure `tailscale` is on PATH.";
 const TAILSCALE_COMMAND_TIMEOUT_MS = 30_000;
 
 /**
@@ -243,6 +245,49 @@ export function getUsedServePorts(runner: TailscaleCommandRunner = defaultRunner
   }
 }
 
+/** The local address a serve or funnel registered by portless sends traffic to. */
+function localTarget(localPort: number): string {
+  return `http://127.0.0.1:${localPort}`;
+}
+
+/**
+ * Whether Tailscale currently sends HTTPS port `httpsPort` to local port `localPort`, read from
+ * `tailscale serve status --json`. Throws when the status can't be read, so a caller can tell a
+ * registration that is gone (or now someone else's) from one it could not check.
+ */
+export function servesLocalPort(
+  httpsPort: number,
+  localPort: number,
+  runner: TailscaleCommandRunner = defaultRunner
+): boolean {
+  const result = runner(["serve", "status", "--json"]);
+  if (result.error) {
+    const errno = result.error as NodeJS.ErrnoException;
+    if (errno.code === "ENOENT") throw new Error(TAILSCALE_NOT_FOUND);
+    throw new Error(`Failed to read tailscale serve status: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const details = normalizeSpace(result.stderr || result.stdout);
+    throw new Error(
+      `Failed to read tailscale serve status: ${details || "unknown tailscale error"}`
+    );
+  }
+  let config: ServeStatusJson;
+  try {
+    config = JSON.parse(result.stdout) as ServeStatusJson;
+  } catch {
+    throw new Error("Failed to parse `tailscale serve status --json` output.");
+  }
+  for (const [hostPort, site] of Object.entries(config.Web ?? {})) {
+    if (!hostPort.endsWith(`:${httpsPort}`)) continue;
+    const root = site.Handlers?.["/"];
+    if (typeof root === "object" && root !== null && "Proxy" in root) {
+      return root.Proxy === localTarget(localPort);
+    }
+  }
+  return false;
+}
+
 /**
  * Pick the next available HTTPS port from the preferred sequence.
  * Returns the first port not in `usedPorts`. Funnel mode is restricted
@@ -312,14 +357,12 @@ function register(
   httpsPort: number,
   runner: TailscaleCommandRunner
 ): void {
-  const target = `http://127.0.0.1:${localPort}`;
+  const target = localTarget(localPort);
   const result = runner([mode, "--bg", "--yes", `--https=${httpsPort}`, target]);
   if (result.error) {
     const errno = result.error as NodeJS.ErrnoException;
     if (errno.code === "ENOENT") {
-      throw new Error(
-        "Tailscale CLI not found. Install Tailscale (https://tailscale.com/download) and ensure `tailscale` is on PATH."
-      );
+      throw new Error(TAILSCALE_NOT_FOUND);
     }
     if (mode === "funnel" && isFunnelNotEnabledError(result.stderr, result.stdout)) {
       throw new Error(formatFunnelNotEnabledError(result.stderr, result.stdout));
@@ -357,7 +400,8 @@ function unregister(
   const result = runner([mode, "--yes", `--https=${httpsPort}`, "off"]);
   if (result.error) {
     const errno = result.error as NodeJS.ErrnoException;
-    if (errno.code === "ENOENT") return;
+    // Without the CLI nothing was removed; callers keep the registration's record (#280).
+    if (errno.code === "ENOENT") throw new Error(TAILSCALE_NOT_FOUND);
     throw new Error(`Failed to remove tailscale ${mode}: ${result.error.message}`);
   }
   if (result.status !== 0) {
@@ -406,8 +450,10 @@ export function unregisterFunnel(
 }
 
 /**
- * Best-effort cleanup of a tailscale serve or funnel registration from a
- * route's metadata. Picks the right subcommand based on `tailscaleFunnel`.
+ * Remove a tailscale serve or funnel registration from a route's metadata.
+ * Picks the right subcommand based on `tailscaleFunnel`. A registration that
+ * is already gone counts as removed; throws when removal could not run or
+ * failed, including when the Tailscale CLI is missing.
  */
 export function unregisterTailscale(route: {
   tailscaleHttpsPort?: number;

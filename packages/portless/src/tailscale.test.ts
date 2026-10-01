@@ -4,6 +4,7 @@ import {
   findAvailableServePort,
   formatTailscaleUrl,
   getUsedServePorts,
+  servesLocalPort,
   registerFunnel,
   registerServe,
   unregisterFunnel,
@@ -207,6 +208,49 @@ describe("tailscale", () => {
   // getUsedServePorts
   // -----------------------------------------------------------------------
 
+  describe("servesLocalPort", () => {
+    const status = (web: object) => ({
+      "serve status --json": { status: 0, stdout: JSON.stringify({ Web: web }) },
+    });
+
+    it("is true when the HTTPS port still proxies to the local port", () => {
+      const runner = createRunner(
+        status({
+          "devbox.example.ts.net:443": { Handlers: { "/": { Proxy: "http://127.0.0.1:4100" } } },
+        })
+      );
+      expect(servesLocalPort(443, 4100, runner)).toBe(true);
+    });
+
+    it("is false when the port now proxies elsewhere or is not served", () => {
+      const runner = createRunner(
+        status({
+          "devbox.example.ts.net:443": { Handlers: { "/": { Proxy: "http://127.0.0.1:4200" } } },
+        })
+      );
+      expect(servesLocalPort(443, 4100, runner)).toBe(false);
+      expect(servesLocalPort(8443, 4100, runner)).toBe(false);
+    });
+
+    it("throws when the status cannot be read", () => {
+      const enoent = Object.assign(new Error("spawn tailscale ENOENT"), { code: "ENOENT" });
+      expect(() =>
+        servesLocalPort(
+          443,
+          4100,
+          createRunner({ "serve status --json": { status: null, error: enoent } })
+        )
+      ).toThrow("Tailscale CLI not found");
+      expect(() =>
+        servesLocalPort(
+          443,
+          4100,
+          createRunner({ "serve status --json": { status: 1, stderr: "not running" } })
+        )
+      ).toThrow("not running");
+    });
+  });
+
   describe("getUsedServePorts", () => {
     it("parses Web ports from serve status JSON", () => {
       const runner = createRunner({
@@ -395,14 +439,16 @@ describe("tailscale", () => {
       expect(() => unregisterServe(443, { runner })).toThrow("permission denied");
     });
 
-    it("silently returns on ENOENT", () => {
+    it("throws on ENOENT, since nothing was removed", () => {
       const enoent = Object.assign(new Error("spawn tailscale ENOENT"), {
         code: "ENOENT",
       });
       const runner = createRunner({
         "serve --yes --https=443 off": { status: null, error: enoent },
       });
-      expect(() => unregisterServe(443, { runner })).not.toThrow();
+      expect(() => unregisterServe(443, { ignoreMissing: true, runner })).toThrow(
+        "Tailscale CLI not found"
+      );
     });
   });
 
