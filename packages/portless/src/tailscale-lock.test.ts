@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { withTailscaleLock } from "./tailscale-lock.js";
+import { processStartTime, withTailscaleLock } from "./tailscale-lock.js";
 
 describe("withTailscaleLock", () => {
   let dir: string;
@@ -18,8 +18,8 @@ describe("withTailscaleLock", () => {
   });
 
   /** Write a lock held by `pid`, last modified `ageMs` ago. */
-  function writeLock(pid: number, token: string, ageMs: number): void {
-    fs.writeFileSync(lockPath, JSON.stringify({ pid, token }));
+  function writeLock(pid: number, token: string, ageMs: number, started?: string): void {
+    fs.writeFileSync(lockPath, JSON.stringify({ pid, token, started }));
     const at = new Date(Date.now() - ageMs);
     fs.utimesSync(lockPath, at, at);
   }
@@ -47,9 +47,9 @@ describe("withTailscaleLock", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it("never takes a live owner's lock because of its age", () => {
+  it("never takes a live owner's lock, however old", () => {
     // A holder can be blocked in tailscale commands far longer than the route lock's 10 seconds.
-    writeLock(process.pid, "holder", 60_000);
+    writeLock(process.pid, "holder", 60 * 60_000, processStartTime(process.pid));
     let ran = false;
     expect(() =>
       withTailscaleLock(
@@ -59,7 +59,7 @@ describe("withTailscaleLock", () => {
         },
         { timeoutMs: 300 }
       )
-    ).toThrow("Failed to acquire Tailscale lock");
+    ).toThrow(`Failed to acquire Tailscale lock held by process ${process.pid}`);
     expect(ran).toBe(false);
     expect(lockToken()).toBe("holder");
   });
@@ -74,9 +74,40 @@ describe("withTailscaleLock", () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it("takes a live owner's lock once it is held past the ceiling, in case its PID was reused", () => {
-    writeLock(process.pid, "reused", 5_000);
-    expect(withTailscaleLock(dir, () => true, { timeoutMs: 300, maxHoldMs: 1_000 })).toBe(true);
+  it("takes a lock whose PID now belongs to a process that started later", () => {
+    writeLock(process.pid, "reused", 0, "100");
+    const ran = withTailscaleLock(dir, () => lockToken() !== "reused", {
+      timeoutMs: 300,
+      startedAt: () => "200",
+    });
+    expect(ran).toBe(true);
+  });
+
+  it("keeps a live owner's lock when start times can't be compared", () => {
+    writeLock(process.pid, "unknown-start", 0, "100");
+    expect(() =>
+      withTailscaleLock(dir, () => true, { timeoutMs: 300, startedAt: () => undefined })
+    ).toThrow("Failed to acquire Tailscale lock");
+    writeLock(process.pid, "no-recorded-start", 0);
+    expect(() =>
+      withTailscaleLock(dir, () => true, { timeoutMs: 300, startedAt: () => "200" })
+    ).toThrow("Failed to acquire Tailscale lock");
+  });
+
+  it.skipIf(process.platform === "win32")("records the owner's start time", () => {
+    const recorded = withTailscaleLock(
+      dir,
+      () => (JSON.parse(fs.readFileSync(lockPath, "utf-8")) as { started?: string }).started
+    );
+    expect(recorded).toBeDefined();
+    expect(recorded).toBe(processStartTime(process.pid));
+  });
+
+  it.skipIf(process.platform === "win32")("tells processes apart by start time", () => {
+    const started = processStartTime(process.pid);
+    expect(started).toMatch(/\S/);
+    expect(processStartTime(process.ppid)).not.toBe(started);
+    expect(processStartTime(999_999_999)).toBeUndefined();
   });
 
   it("takes a lock directory left by an older version only once it is stale", () => {

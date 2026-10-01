@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -7,11 +8,11 @@ import { isErrnoException, isProcessAlive } from "./utils.js";
  * A lock for releasing stale Tailscale registrations and registering new ones (#280).
  *
  * Unlike the route lock, a section holding this lock runs `tailscale` commands, each of which can
- * take up to 30 seconds, so the lock is never taken from a live owner because of its age. The lock
- * file names its owner; only a lock whose owner has exited (or one held implausibly long, in case
- * its PID was reused) is removed, and only by a process that has re-checked it under a short steal
- * lock, so two waiters can't both judge a lock stale and then remove each other's fresh one. A
- * holder releases only its own lock.
+ * take up to 30 seconds, so the lock is never taken from a live owner because of its age: waiters
+ * time out instead. The lock file names its owner by PID and start time; only a lock whose owner
+ * has exited, or whose PID now belongs to a process that started at another time, is removed, and
+ * only by a process that has re-checked it under a short steal lock, so two waiters can't both
+ * judge a lock stale and then remove each other's fresh one. A holder releases only its own lock.
  */
 
 const LOCK_FILE = "tailscale.lock";
@@ -21,20 +22,53 @@ const STEAL_DIR = "tailscale.lock.steal";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const RETRY_BASE_MS = 25;
 const RETRY_CAP_MS = 250;
-/** A live owner's lock is taken after this long, in case the owner's PID was reused. */
-const DEFAULT_MAX_HOLD_MS = 10 * 60_000;
 /** The steal lock, and a lock file without a readable owner, are only held for a few file operations. */
 const SHORT_LIVED_STALE_MS = 10_000;
 
 export interface TailscaleLockOptions {
   timeoutMs?: number;
-  maxHoldMs?: number;
   isAlive?: (pid: number) => boolean;
+  /** When a process started, or undefined when that can't be told. */
+  startedAt?: (pid: number) => string | undefined;
 }
 
 interface LockOwner {
   pid: number;
   token: string;
+  /** When the owner started, to tell it from a later process given the same PID. */
+  started?: string;
+}
+
+interface LockChecks {
+  isAlive: (pid: number) => boolean;
+  startedAt: (pid: number) => string | undefined;
+}
+
+/**
+ * When a process started: its boot-relative start time from `/proc` on Linux, or `ps` elsewhere.
+ * Undefined when it can't be read, such as on Windows.
+ */
+export function processStartTime(pid: number): string | undefined {
+  if (process.platform === "win32") return undefined;
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+      // Fields after the command name, which may contain spaces; `starttime` is field 22 overall.
+      return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+    });
+    return output.trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 interface LockOnDisk {
@@ -61,7 +95,9 @@ function parseOwner(raw: string): LockOwner | undefined {
       typeof parsed.pid === "number" &&
       typeof parsed.token === "string"
     ) {
-      return { pid: parsed.pid, token: parsed.token };
+      const started =
+        "started" in parsed && typeof parsed.started === "string" ? parsed.started : undefined;
+      return { pid: parsed.pid, token: parsed.token, ...(started ? { started } : {}) };
     }
   } catch {
     // Not an owner record
@@ -102,19 +138,17 @@ function tryCreate(lockPath: string, owner: LockOwner): boolean {
   }
 }
 
-function isStale(lock: LockOnDisk, isAlive: (pid: number) => boolean, maxHoldMs: number): boolean {
+function isStale(lock: LockOnDisk, checks: LockChecks): boolean {
   if (lock.owner === undefined) return lock.ageMs > SHORT_LIVED_STALE_MS;
-  if (!isAlive(lock.owner.pid)) return true;
-  return lock.ageMs > maxHoldMs;
+  if (!checks.isAlive(lock.owner.pid)) return true;
+  // A live process with the owner's PID is the owner, unless it provably started at another time.
+  if (lock.owner.started === undefined) return false;
+  const started = checks.startedAt(lock.owner.pid);
+  return started !== undefined && started !== lock.owner.started;
 }
 
 /** Remove a stale lock, but only if it is still the one that was judged stale. */
-function removeIfStillStale(
-  dir: string,
-  seen: LockOnDisk,
-  isAlive: (pid: number) => boolean,
-  maxHoldMs: number
-): void {
+function removeIfStillStale(dir: string, seen: LockOnDisk, checks: LockChecks): void {
   const stealPath = path.join(dir, STEAL_DIR);
   try {
     fs.mkdirSync(stealPath);
@@ -137,7 +171,7 @@ function removeIfStillStale(
       current !== undefined &&
       current.ino === seen.ino &&
       current.owner?.token === seen.owner?.token &&
-      isStale(current, isAlive, maxHoldMs)
+      isStale(current, checks)
     ) {
       fs.rmSync(lockPath, { recursive: true, force: true });
     }
@@ -156,10 +190,17 @@ export function withTailscaleLock<T>(
   options: TailscaleLockOptions = {}
 ): T {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const maxHoldMs = options.maxHoldMs ?? DEFAULT_MAX_HOLD_MS;
-  const isAlive = options.isAlive ?? isProcessAlive;
+  const checks: LockChecks = {
+    isAlive: options.isAlive ?? isProcessAlive,
+    startedAt: options.startedAt ?? processStartTime,
+  };
   const lockPath = path.join(dir, LOCK_FILE);
-  const owner: LockOwner = { pid: process.pid, token: randomUUID() };
+  const started = checks.startedAt(process.pid);
+  const owner: LockOwner = {
+    pid: process.pid,
+    token: randomUUID(),
+    ...(started ? { started } : {}),
+  };
 
   const deadline = Date.now() + timeoutMs;
   let delay = RETRY_BASE_MS;
@@ -170,12 +211,15 @@ export function withTailscaleLock<T>(
     const current = readLock(lockPath);
     // Gone since the attempt: try again right away.
     if (current === undefined) continue;
-    if (isStale(current, isAlive, maxHoldMs)) {
-      removeIfStillStale(dir, current, isAlive, maxHoldMs);
+    if (isStale(current, checks)) {
+      removeIfStillStale(dir, current, checks);
       if (readLock(lockPath)?.ino !== current.ino) continue;
     }
     if (Date.now() >= deadline) {
-      throw new Error("Failed to acquire Tailscale lock");
+      const holder = current.owner ? ` held by process ${current.owner.pid}` : "";
+      throw new Error(
+        `Failed to acquire Tailscale lock${holder}. If no portless process is running, remove ${lockPath}.`
+      );
     }
     sleep(delay + Math.floor(Math.random() * delay));
     delay = Math.min(delay * 2, RETRY_CAP_MS);
