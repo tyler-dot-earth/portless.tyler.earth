@@ -29,7 +29,14 @@ import {
   cleanHostsFile,
   shouldAutoSyncHosts,
 } from "./hosts.js";
-import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
+import {
+  FILE_MODE,
+  holdsRegistration,
+  RouteConflictError,
+  type RouteMapping,
+  routeKey,
+  RouteStore,
+} from "./routes.js";
 import {
   ensureTailscaleReady,
   findAvailableServePort,
@@ -525,6 +532,38 @@ function addRoutes(
     throw err;
   }
   return [...new Set(killedPids)];
+}
+
+/**
+ * Release what a route registered outside portless: its Tailscale serve or funnel and its ngrok
+ * tunnel. Returns false when the Tailscale registration could not be removed; the caller then keeps
+ * the route, since it is the registration's only record (#280).
+ */
+function releaseRouteRegistrations(route: RouteMapping): boolean {
+  let released = true;
+  if (route.tailscaleHttpsPort) {
+    try {
+      unregisterTailscale(route);
+    } catch {
+      released = false;
+    }
+  }
+  stopNgrok(route);
+  return released;
+}
+
+/**
+ * Release registrations left by sessions that died before cleaning up, then drop their routes.
+ * Returns the routes released.
+ */
+function releaseStaleRegistrations(store: RouteStore): RouteMapping[] {
+  const releasedRoutes = store
+    .staleRoutes()
+    .filter((route) => holdsRegistration(route) && releaseRouteRegistrations(route));
+  if (releasedRoutes.length > 0) {
+    store.pruneStaleRoutes(new Set(releasedRoutes.map(routeKey)));
+  }
+  return releasedRoutes;
 }
 
 function removeRoutes(store: RouteStore, hostnames: readonly string[], ownerPid?: number): void {
@@ -1381,6 +1420,34 @@ async function runApp(
   let ngrokUrl: string | undefined;
   let ngrokProcess: Awaited<ReturnType<typeof startNgrok>> | undefined;
   let stoppingNgrok = false;
+  let tailscaleReleased = false;
+  /** Remove this run's Tailscale registration once; returns whether it is gone. */
+  const releaseTailscale = (): boolean => {
+    if (tailscaleReleased || tailscaleHttpsPort === undefined) return true;
+    try {
+      unregisterTailscale({ tailscaleHttpsPort, tailscaleFunnel: wantsFunnel || undefined });
+      tailscaleReleased = true;
+    } catch {
+      // Keep the route below so `portless prune` or the next shared run can retry
+    }
+    return tailscaleReleased;
+  };
+  /** Remove this run's routes, unless they are the only record of a Tailscale registration. */
+  const removeRoutesIfReleased = (): void => {
+    if (!releaseTailscale()) {
+      console.warn(
+        colors.yellow(
+          `Warning: could not remove the Tailscale serve on port ${tailscaleHttpsPort}. Keeping its route so \`portless prune\` can retry.`
+        )
+      );
+      return;
+    }
+    try {
+      removeRoutes(store, hostnames, process.pid);
+    } catch {
+      // Lock acquisition may fail during cleanup; non-fatal
+    }
+  };
   let ngrokRouteReady = false;
   let ngrokExitHandled = false;
   let pendingNgrokExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
@@ -1412,6 +1479,21 @@ async function runApp(
   };
 
   if (wantsTailscale && tsBaseUrl) {
+    // A session that died before cleaning up can leave its serve behind, which would push this
+    // run to the next free port. Release those first.
+    try {
+      for (const stale of releaseStaleRegistrations(store)) {
+        if (stale.tailscaleHttpsPort) {
+          console.log(
+            colors.dim(
+              `  Released a stale Tailscale serve on port ${stale.tailscaleHttpsPort} (${stale.hostname}).`
+            )
+          );
+        }
+      }
+    } catch {
+      // Lock contention or a missing CLI; registration below still works
+    }
     const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const usedPorts = getUsedServePorts();
@@ -1490,19 +1572,7 @@ async function runApp(
         console.error(colors.blue("Configure ngrok authentication:"));
         console.error(colors.cyan("  ngrok config add-authtoken <token>"));
       }
-      try {
-        unregisterTailscale({
-          tailscaleHttpsPort,
-          tailscaleFunnel: wantsFunnel || undefined,
-        });
-      } catch {
-        // Best-effort cleanup; non-fatal
-      }
-      try {
-        removeRoutes(store, hostnames, process.pid);
-      } catch {
-        // Best-effort cleanup; non-fatal
-      }
+      removeRoutesIfReleased();
       process.exit(1);
     }
   }
@@ -1569,22 +1639,13 @@ async function runApp(
       ...(ngrokUrl ? { PORTLESS_NGROK_URL: ngrokUrl } : {}),
       ...caEnv,
     },
+    // Release the serve as soon as shutdown begins: a supervisor may kill this process while
+    // the child is still stopping, and then onCleanup never runs.
+    onShutdown: releaseTailscale,
     onCleanup: () => {
       stoppingNgrok = true;
       stopNgrokProcess(ngrokProcess?.child);
-      try {
-        unregisterTailscale({
-          tailscaleHttpsPort,
-          tailscaleFunnel: wantsFunnel || undefined,
-        });
-      } catch {
-        // Best-effort cleanup; non-fatal
-      }
-      try {
-        removeRoutes(store, hostnames, process.pid);
-      } catch {
-        // Lock acquisition may fail during cleanup; non-fatal
-      }
+      removeRoutesIfReleased();
     },
   });
 }
@@ -2216,27 +2277,34 @@ ${colors.bold("Options:")}
     onWarning: (msg) => console.warn(colors.yellow(msg)),
   });
 
-  const stale = store.pruneStaleRoutes();
+  // Release registrations before removing routes: a stale route is the only record of its
+  // Tailscale serve, so one whose release fails stays for the next prune to retry (#280).
+  const released = new Set<string>();
+  for (const route of store.staleRoutes()) {
+    if (!holdsRegistration(route)) continue;
+    if (!releaseRouteRegistrations(route)) {
+      console.warn(
+        colors.yellow(
+          `  ${route.hostname} - could not remove tailscale serve on port ${route.tailscaleHttpsPort}; keeping its route to retry`
+        )
+      );
+      continue;
+    }
+    released.add(routeKey(route));
+    if (route.tailscaleHttpsPort) {
+      console.log(
+        `  ${route.hostname} - removed tailscale serve on port ${route.tailscaleHttpsPort}`
+      );
+    }
+    if (route.ngrokPid) {
+      console.log(`  ${route.hostname} - stopped ngrok tunnel`);
+    }
+  }
+
+  const stale = store.pruneStaleRoutes(released);
   if (stale.length === 0) {
     console.log("No orphaned routes found.");
     return;
-  }
-
-  for (const route of stale) {
-    if (route.tailscaleHttpsPort) {
-      try {
-        unregisterTailscale(route);
-        console.log(
-          `  ${route.hostname} - removed tailscale serve on port ${route.tailscaleHttpsPort}`
-        );
-      } catch {
-        // Tailscale CLI may not be installed; non-fatal during prune
-      }
-    }
-    if (route.ngrokPid) {
-      stopNgrok(route);
-      console.log(`  ${route.hostname} - stopped ngrok tunnel`);
-    }
   }
 
   let killed = 0;

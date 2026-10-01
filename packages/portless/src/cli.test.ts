@@ -1760,6 +1760,87 @@ describe("CLI", () => {
     });
   });
 
+  describe("prune with Tailscale registrations (#280)", () => {
+    let tmpRoot: string;
+    let stateDir: string;
+    let binDir: string;
+    let logPath: string;
+    const staleRoute = {
+      hostname: "shared.localhost",
+      port: 4100,
+      pid: 999999,
+      tailscaleUrl: "https://host.example.ts.net:8443",
+      tailscaleHttpsPort: 8443,
+    };
+
+    beforeEach(() => {
+      tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "portless-prune-tailscale-"));
+      stateDir = path.join(tmpRoot, "state");
+      binDir = path.join(tmpRoot, "bin");
+      logPath = path.join(tmpRoot, "tailscale.log");
+      fs.mkdirSync(stateDir, { recursive: true });
+      fs.mkdirSync(binDir, { recursive: true });
+      // A stand-in tailscale CLI that logs its arguments and can be told to fail "off".
+      fs.writeFileSync(
+        path.join(binDir, "tailscale"),
+        [
+          "#!/bin/sh",
+          'echo "$@" >> "$FAKE_TAILSCALE_LOG"',
+          'if [ "$FAKE_TAILSCALE_FAIL_OFF" = 1 ]; then',
+          '  for arg in "$@"; do [ "$arg" = off ] && { echo "interrupted" >&2; exit 1; }; done',
+          "fi",
+          "exit 0",
+        ].join("\n"),
+        { mode: 0o755 }
+      );
+      fs.writeFileSync(path.join(stateDir, "routes.json"), JSON.stringify([staleRoute]));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    function prune(failOff: boolean) {
+      return run(["prune"], {
+        env: {
+          PORTLESS_STATE_DIR: stateDir,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          FAKE_TAILSCALE_LOG: logPath,
+          FAKE_TAILSCALE_FAIL_OFF: failOff ? "1" : "0",
+        },
+      });
+    }
+
+    function routesOnDisk(): string[] {
+      const routes: { hostname: string }[] = JSON.parse(
+        fs.readFileSync(path.join(stateDir, "routes.json"), "utf-8")
+      );
+      return routes.map((route) => route.hostname);
+    }
+
+    it.skipIf(process.platform === "win32")(
+      "keeps a stale route whose Tailscale serve could not be removed",
+      () => {
+        const { status, stderr } = prune(true);
+        expect(status).toBe(0);
+        expect(stderr).toContain("could not remove tailscale serve on port 8443");
+        expect(routesOnDisk()).toEqual(["shared.localhost"]);
+      }
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "removes the serve, then the route, once release succeeds",
+      () => {
+        prune(true);
+        const { status, stdout } = prune(false);
+        expect(status).toBe(0);
+        expect(stdout).toContain("removed tailscale serve on port 8443");
+        expect(fs.readFileSync(logPath, "utf-8")).toContain("serve --yes --https=8443 off");
+        expect(routesOnDisk()).toEqual([]);
+      }
+    );
+  });
+
   describe("get subcommand", () => {
     let tmpDir: string;
 

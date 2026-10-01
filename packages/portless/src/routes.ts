@@ -30,6 +30,20 @@ export interface RouteMapping extends RouteInfo {
   ngrokPid?: number;
 }
 
+/**
+ * Whether a route still records something outside portless that only it can release: a Tailscale
+ * serve or funnel, or an ngrok tunnel. Such a route is the only record of the registration, so it
+ * must not be dropped until the registration is released, even after its owner has died (#280).
+ */
+export function holdsRegistration(route: RouteMapping): boolean {
+  return route.tailscaleHttpsPort !== undefined || route.ngrokPid !== undefined;
+}
+
+/** Identifies one route entry; a hostname can be reused by a later owner. */
+export function routeKey(route: Pick<RouteMapping, "hostname" | "pid">): string {
+  return `${route.hostname}@${route.pid}`;
+}
+
 type RouteMetadataPatch = {
   tailscaleUrl?: string | null;
   tailscaleHttpsPort?: number | null;
@@ -192,20 +206,36 @@ export class RouteStore {
       // Filter out stale routes whose owning process is no longer alive
       const alive = routes.filter((r) => r.pid === 0 || this.isProcessAlive(r.pid));
       if (persistCleanup && alive.length !== routes.length) {
-        // Persist the cleaned-up list so stale entries don't accumulate.
-        // Only safe when caller holds the lock.
-        try {
-          fs.writeFileSync(this.routesPath, JSON.stringify(alive, null, 2), {
-            mode: FILE_MODE,
-          });
-        } catch {
-          // Write may fail (permissions); non-fatal
+        // Persist the cleaned-up list so stale entries don't accumulate, but keep stale entries
+        // that still hold a registration: they are its only record, and `portless prune` (or the
+        // next shared run) releases them. Only safe when caller holds the lock.
+        const kept = routes.filter(
+          (r) => r.pid === 0 || this.isProcessAlive(r.pid) || holdsRegistration(r)
+        );
+        if (kept.length !== routes.length) {
+          try {
+            fs.writeFileSync(this.routesPath, JSON.stringify(kept, null, 2), {
+              mode: FILE_MODE,
+            });
+          } catch {
+            // Write may fail (permissions); non-fatal
+          }
         }
       }
       return alive;
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Stale routes that still hold a registration, which writers carry over unchanged. Only safe
+   * when the caller holds the lock.
+   */
+  private heldStaleRoutes(): RouteMapping[] {
+    return this.loadRoutesRaw().filter(
+      (r) => r.pid !== 0 && !this.isProcessAlive(r.pid) && holdsRegistration(r)
+    );
   }
 
   private saveRoutes(routes: RouteMapping[]): void {
@@ -243,7 +273,7 @@ export class RouteStore {
       const filtered = routes.filter((r) => r.hostname !== hostname);
       const entry: RouteMapping = { hostname, port, pid };
       filtered.push(entry);
-      this.saveRoutes(filtered);
+      this.saveRoutes([...filtered, ...this.heldStaleRoutes()]);
     } finally {
       this.releaseLock();
     }
@@ -281,27 +311,37 @@ export class RouteStore {
   }
 
   /**
-   * Remove all route entries whose owning process is dead and persist the
-   * result. Returns the removed stale entries so the caller can act on them.
+   * Stale routes (owner no longer alive), read without changing anything. `portless prune` uses
+   * them to release registrations before removing routes.
    */
-  pruneStaleRoutes(): RouteMapping[] {
+  staleRoutes(): RouteMapping[] {
+    return this.loadRoutesRaw().filter((r) => r.pid !== 0 && !this.isProcessAlive(r.pid));
+  }
+
+  /**
+   * Remove stale routes and return them. A stale route that still holds a registration is kept
+   * unless its key is in `released`, so the registration keeps a record until someone releases
+   * it; dropping it would orphan the registration for good (#280).
+   */
+  pruneStaleRoutes(released: ReadonlySet<string> = new Set()): RouteMapping[] {
     this.ensureDir();
     if (!this.acquireLock()) {
       throw new Error("Failed to acquire route lock");
     }
     try {
       const all = this.loadRoutesRaw();
-      const alive: RouteMapping[] = [];
+      const kept: RouteMapping[] = [];
       const stale: RouteMapping[] = [];
       for (const r of all) {
-        if (r.pid === 0 || this.isProcessAlive(r.pid)) {
-          alive.push(r);
-        } else {
+        const isStale = r.pid !== 0 && !this.isProcessAlive(r.pid);
+        if (isStale && (!holdsRegistration(r) || released.has(routeKey(r)))) {
           stale.push(r);
+        } else {
+          kept.push(r);
         }
       }
       if (stale.length > 0) {
-        this.saveRoutes(alive);
+        this.saveRoutes(kept);
       }
       return stale;
     } finally {
@@ -344,7 +384,7 @@ export class RouteStore {
         if (fields.ngrokPid === null) delete route.ngrokPid;
         else if (fields.ngrokPid !== undefined) route.ngrokPid = fields.ngrokPid;
       }
-      this.saveRoutes(routes);
+      this.saveRoutes([...routes, ...this.heldStaleRoutes()]);
     } finally {
       this.releaseLock();
     }
@@ -365,7 +405,7 @@ export class RouteStore {
       const routes = this.loadRoutes(true).filter(
         (r) => r.hostname !== hostname || (ownerPid !== undefined && r.pid !== ownerPid)
       );
-      this.saveRoutes(routes);
+      this.saveRoutes([...routes, ...this.heldStaleRoutes()]);
     } finally {
       this.releaseLock();
     }

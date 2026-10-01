@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
-import { RouteStore, RouteConflictError } from "./routes.js";
+import { RouteStore, RouteConflictError, holdsRegistration, routeKey } from "./routes.js";
 
 describe("RouteStore", () => {
   let tmpDir: string;
@@ -498,6 +498,85 @@ describe("RouteStore", () => {
       expect(routes).toHaveLength(1);
       expect(routes[0].ngrokUrl).toBeUndefined();
       expect(routes[0].ngrokPid).toBeUndefined();
+    });
+  });
+  describe("stale routes that hold a registration (#280)", () => {
+    const deadPid = 999999;
+    const held = {
+      hostname: "shared.localhost",
+      port: 4100,
+      pid: deadPid,
+      tailscaleUrl: "https://host.example.ts.net",
+      tailscaleHttpsPort: 443,
+    };
+    const plain = { hostname: "plain.localhost", port: 4101, pid: deadPid };
+    const live = { hostname: "live.localhost", port: 4102, pid: process.pid };
+
+    function writeRoutes(routes: object[]): void {
+      store.ensureDir();
+      fs.writeFileSync(store.getRoutesPath(), JSON.stringify(routes));
+    }
+
+    function hostnamesOnDisk(): string[] {
+      return store.loadRoutesRaw().map((r) => r.hostname);
+    }
+
+    it("recognizes routes holding a Tailscale serve or ngrok tunnel", () => {
+      expect(holdsRegistration(held)).toBe(true);
+      expect(holdsRegistration({ ...plain, ngrokPid: 123 })).toBe(true);
+      expect(holdsRegistration(plain)).toBe(false);
+    });
+
+    it("keeps them on disk when cleanup persists, and drops plain stale routes", () => {
+      writeRoutes([held, plain, live]);
+      expect(store.loadRoutes(true).map((r) => r.hostname)).toEqual(["live.localhost"]);
+      expect(hostnamesOnDisk()).toEqual(["shared.localhost", "live.localhost"]);
+    });
+
+    it("keeps them when another route is added, updated, or removed", () => {
+      writeRoutes([held, plain, live]);
+      store.addRoute("new.localhost", 4103, process.pid);
+      expect(hostnamesOnDisk()).toEqual(
+        expect.arrayContaining(["shared.localhost", "live.localhost", "new.localhost"])
+      );
+      expect(hostnamesOnDisk()).not.toContain("plain.localhost");
+
+      store.updateRoute("new.localhost", { tailscaleUrl: "https://host.example.ts.net:8443" });
+      expect(hostnamesOnDisk()).toContain("shared.localhost");
+
+      store.removeRoute("new.localhost", process.pid);
+      expect(hostnamesOnDisk()).toEqual(
+        expect.arrayContaining(["shared.localhost", "live.localhost"])
+      );
+      expect(hostnamesOnDisk()).not.toContain("new.localhost");
+    });
+
+    it("keeps a held route when its hostname is registered again by a live owner", () => {
+      writeRoutes([held]);
+      store.addRoute("shared.localhost", 4200, process.pid);
+      const entries = store.loadRoutesRaw().filter((r) => r.hostname === "shared.localhost");
+      expect(entries.map((r) => r.pid).sort()).toEqual([process.pid, deadPid].sort());
+      expect(store.loadRoutes().map((r) => r.port)).toEqual([4200]);
+    });
+
+    it("lists stale routes without changing anything", () => {
+      writeRoutes([held, plain, live]);
+      expect(store.staleRoutes().map((r) => r.hostname)).toEqual([
+        "shared.localhost",
+        "plain.localhost",
+      ]);
+      expect(hostnamesOnDisk()).toHaveLength(3);
+    });
+
+    it("prunes a held route only once its registration is released", () => {
+      writeRoutes([held, plain, live]);
+      expect(store.pruneStaleRoutes().map((r) => r.hostname)).toEqual(["plain.localhost"]);
+      expect(hostnamesOnDisk()).toEqual(["shared.localhost", "live.localhost"]);
+
+      expect(store.pruneStaleRoutes(new Set([routeKey(held)])).map((r) => r.hostname)).toEqual([
+        "shared.localhost",
+      ]);
+      expect(hostnamesOnDisk()).toEqual(["live.localhost"]);
     });
   });
 });
