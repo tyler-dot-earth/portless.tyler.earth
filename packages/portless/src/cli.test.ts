@@ -1886,6 +1886,36 @@ describe("CLI", () => {
     );
 
     it.skipIf(process.platform === "win32")(
+      "stops the ngrok tunnel of a route kept for its Tailscale serve",
+      async () => {
+        const tunnel = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+          stdio: "ignore",
+        });
+        try {
+          const both = { ...staleRoute, ngrokPid: tunnel.pid, ngrokUrl: "https://x.ngrok.app" };
+          writeRoutes([both]);
+          const { status, stdout } = prune({ failOff: true });
+          expect(status).toBe(0);
+          expect(stdout).toContain("stopped ngrok tunnel");
+          const exited = await new Promise<boolean>((resolve) => {
+            if (tunnel.exitCode !== null || tunnel.signalCode !== null) return resolve(true);
+            const timer = setTimeout(() => resolve(false), 3000);
+            tunnel.once("exit", () => {
+              clearTimeout(timer);
+              resolve(true);
+            });
+          });
+          expect(exited).toBe(true);
+          const [kept] = JSON.parse(fs.readFileSync(path.join(stateDir, "routes.json"), "utf-8"));
+          expect(kept.tailscaleHttpsPort).toBe(8443);
+          expect(kept.ngrokPid).toBeUndefined();
+        } finally {
+          tunnel.kill("SIGKILL");
+        }
+      }
+    );
+
+    it.skipIf(process.platform === "win32")(
       "keeps the route when the Tailscale CLI is missing",
       () => {
         const emptyBin = path.join(tmpRoot, "empty-bin");

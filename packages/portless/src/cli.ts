@@ -560,7 +560,7 @@ function releaseStaleTailscale(
 
 /**
  * Release Tailscale registrations recorded by sessions that died before cleaning up, then drop
- * those routes. Returns the routes whose serve was removed.
+ * those routes. Returns the routes whose serve was removed. Call it holding the Tailscale lock.
  */
 function releaseStaleRegistrations(store: RouteStore): RouteMapping[] {
   const liveRoutes = store.loadRoutes();
@@ -573,7 +573,7 @@ function releaseStaleRegistrations(store: RouteStore): RouteMapping[] {
     released.push(route);
     if (result === "removed") removed.push(route);
   }
-  if (released.length > 0) store.pruneStaleRoutes(released);
+  if (released.length > 0) store.pruneStaleRoutes({ released });
   return removed;
 }
 
@@ -1503,61 +1503,74 @@ async function runApp(
   };
 
   if (wantsTailscale && tsBaseUrl) {
-    // A session that died before cleaning up can leave its serve behind, which would push this
-    // run to the next free port. Release those first.
+    const baseUrl = tsBaseUrl;
+    let registrationError: string | undefined;
     try {
-      for (const stale of releaseStaleRegistrations(store)) {
-        console.log(
-          colors.dim(
-            `  Released a stale Tailscale serve on port ${stale.tailscaleHttpsPort} (${stale.hostname}).`
-          )
-        );
-      }
-    } catch {
-      // Lock contention or a missing CLI; registration below still works
-    }
-    const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const usedPorts = getUsedServePorts();
-      tailscaleHttpsPort = findAvailableServePort(usedPorts, wantsFunnel ? "funnel" : "serve");
-      try {
-        if (wantsFunnel) {
-          registerFunnel(port, tailscaleHttpsPort);
-        } else {
-          registerServe(port, tailscaleHttpsPort);
+      // Hold the Tailscale lock from recovery until this run's serve is recorded on its route, so
+      // another process's recovery never finds the serve registered but not yet recorded (#280).
+      store.withTailscaleLock(() => {
+        // A session that died before cleaning up can leave its serve behind, which would push
+        // this run to the next free port. Release those first.
+        try {
+          for (const stale of releaseStaleRegistrations(store)) {
+            console.log(
+              colors.dim(
+                `  Released a stale Tailscale serve on port ${stale.tailscaleHttpsPort} (${stale.hostname}).`
+              )
+            );
+          }
+        } catch {
+          // Route lock contention; registration below still works
         }
-        break;
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        const isConflict = message.includes("already in use");
-        if (isConflict && attempt < maxAttempts) continue;
-        console.error(colors.red(`Error: ${message}`));
-        process.exit(1);
-      }
+        const maxAttempts = 3;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          const usedPorts = getUsedServePorts();
+          const httpsPort = findAvailableServePort(usedPorts, wantsFunnel ? "funnel" : "serve");
+          try {
+            if (wantsFunnel) {
+              registerFunnel(port, httpsPort);
+            } else {
+              registerServe(port, httpsPort);
+            }
+            tailscaleHttpsPort = httpsPort;
+            break;
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            const isConflict = message.includes("already in use");
+            if (isConflict && attempt < maxAttempts) continue;
+            registrationError = message;
+            return;
+          }
+        }
+
+        tailscaleUrl = formatTailscaleUrl(baseUrl, tailscaleHttpsPort!);
+        try {
+          store.updateRoute(hostname, {
+            tailscaleUrl: tailscaleUrl,
+            tailscaleHttpsPort,
+            tailscaleFunnel: wantsFunnel || undefined,
+          });
+        } catch {
+          // Non-fatal: the local hostname keeps routing without it, but the
+          // proxy needs tailscaleUrl to route requests arriving with the
+          // public .ts.net Host header (see findRoute), so the tailscale URL
+          // may 404 until the route is re-registered.
+        }
+      });
+    } catch (err: unknown) {
+      registrationError = err instanceof Error ? err.message : String(err);
+    }
+    if (registrationError !== undefined) {
+      console.error(colors.red(`Error: ${registrationError}`));
+      process.exit(1);
     }
 
-    // tailscaleHttpsPort is always assigned: the loop either breaks after
-    // a successful register or exits the process on final failure.
-    tailscaleUrl = formatTailscaleUrl(tsBaseUrl, tailscaleHttpsPort!);
     const label = wantsFunnel ? "Funnel (public)" : "Tailscale";
     console.log(chalk.green(`  ${label} -> ${tailscaleUrl}`));
     if (wantsFunnel) {
       console.log(chalk.gray("  (accessible from the public internet via Tailscale Funnel)\n"));
     } else {
       console.log(chalk.gray("  (accessible from your tailnet)\n"));
-    }
-
-    try {
-      store.updateRoute(hostname, {
-        tailscaleUrl: tailscaleUrl,
-        tailscaleHttpsPort,
-        tailscaleFunnel: wantsFunnel || undefined,
-      });
-    } catch {
-      // Non-fatal: the local hostname keeps routing without it, but the
-      // proxy needs tailscaleUrl to route requests arriving with the
-      // public .ts.net Host header (see findRoute), so the tailscale URL
-      // may 404 until the route is re-registered.
     }
   }
 
@@ -2305,41 +2318,49 @@ ${colors.bold("Options:")}
   });
 
   // A stale route is the only record of its Tailscale serve, so release that before removing
-  // routes, and keep any route whose serve could not be released for the next prune (#280).
-  const stale = store.staleRoutes();
+  // routes, and keep any route whose serve could not be released for the next prune (#280). The
+  // Tailscale lock keeps a shared run from registering between a check and its removal.
+  const { stale, liveRoutes, removed, keptCount } = store.withTailscaleLock(() => {
+    const stale = store.staleRoutes();
+    const liveRoutes = store.loadRoutes();
+    const released: RouteMapping[] = [];
+    let keptCount = 0;
+    for (const route of stale) {
+      if (route.tailscaleHttpsPort === undefined) continue;
+      const result = releaseStaleTailscale(route, liveRoutes);
+      if (result === "failed") {
+        keptCount++;
+        console.warn(
+          colors.yellow(
+            `  ${route.hostname} - could not remove tailscale serve on port ${route.tailscaleHttpsPort}; keeping its route to retry`
+          )
+        );
+        continue;
+      }
+      released.push(route);
+      console.log(
+        result === "removed"
+          ? `  ${route.hostname} - removed tailscale serve on port ${route.tailscaleHttpsPort}`
+          : `  ${route.hostname} - tailscale serve on port ${route.tailscaleHttpsPort} already removed`
+      );
+    }
+
+    // Stop ngrok tunnels for every stale route, including one kept for its Tailscale serve.
+    const ngrokStopped = stale.filter((route) => route.ngrokPid !== undefined);
+    const stopTunnel = (route: RouteMapping): void => {
+      stopNgrok(route);
+      console.log(`  ${route.hostname} - stopped ngrok tunnel`);
+    };
+    ngrokStopped.forEach(stopTunnel);
+    const removed = stale.length === 0 ? [] : store.pruneStaleRoutes({ released, ngrokStopped });
+    removed
+      .filter((r) => r.ngrokPid !== undefined && !ngrokStopped.some((s) => isSameRoute(s, r)))
+      .forEach(stopTunnel);
+    return { stale, liveRoutes, removed, keptCount };
+  });
   if (stale.length === 0) {
     console.log("No orphaned routes found.");
     return;
-  }
-  const liveRoutes = store.loadRoutes();
-  const released: RouteMapping[] = [];
-  let keptCount = 0;
-  for (const route of stale) {
-    if (route.tailscaleHttpsPort === undefined) continue;
-    const result = releaseStaleTailscale(route, liveRoutes);
-    if (result === "failed") {
-      keptCount++;
-      console.warn(
-        colors.yellow(
-          `  ${route.hostname} - could not remove tailscale serve on port ${route.tailscaleHttpsPort}; keeping its route to retry`
-        )
-      );
-      continue;
-    }
-    released.push(route);
-    console.log(
-      result === "removed"
-        ? `  ${route.hostname} - removed tailscale serve on port ${route.tailscaleHttpsPort}`
-        : `  ${route.hostname} - tailscale serve on port ${route.tailscaleHttpsPort} already removed`
-    );
-  }
-
-  const removed = store.pruneStaleRoutes(released);
-  for (const route of removed) {
-    if (route.ngrokPid) {
-      stopNgrok(route);
-      console.log(`  ${route.hostname} - stopped ngrok tunnel`);
-    }
   }
 
   // Kill orphaned dev servers for every stale route, including those kept to retry, but never on a
