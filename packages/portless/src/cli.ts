@@ -1442,8 +1442,9 @@ async function runApp(
       return false;
     }
     tailscaleReleased = true;
-    // Forget the port now: another app may take it while this one's child is still stopping, and
-    // if this process is then killed, a leftover record must not lead recovery to that app's serve.
+    // Forget the port now: another app may take it while this one's child is still stopping. This
+    // is best effort, since a supervisor may kill this process right after the release (Turborepo
+    // did within half a second of Ctrl-C), so recovery also checks a serve still targets the route.
     try {
       store.updateRoute(
         hostname,
@@ -1451,7 +1452,7 @@ async function runApp(
         process.pid
       );
     } catch {
-      // Recovery also checks that the serve still targets this route before removing it
+      // Lock contention; recovery's check covers a record left behind
     }
     return true;
   };
