@@ -588,17 +588,6 @@ describe("RouteStore", () => {
       expect(kept.ngrokUrl).toBeUndefined();
     });
 
-    it("runs work under the Tailscale lock and releases it even when the work throws", () => {
-      expect(store.withTailscaleLock(() => 42)).toBe(42);
-      expect(() =>
-        store.withTailscaleLock(() => {
-          throw new Error("boom");
-        })
-      ).toThrow("boom");
-      expect(fs.existsSync(path.join(store.dir, "tailscale.lock"))).toBe(false);
-      expect(store.withTailscaleLock(() => "again")).toBe("again");
-    });
-
     it("updates a route only while the given pid owns it", () => {
       writeRoutes([live]);
       store.updateRoute("live.localhost", { tailscaleHttpsPort: 443 }, deadPid);

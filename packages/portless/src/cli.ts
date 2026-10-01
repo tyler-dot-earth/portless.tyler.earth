@@ -30,6 +30,7 @@ import {
   shouldAutoSyncHosts,
 } from "./hosts.js";
 import { FILE_MODE, RouteConflictError, type RouteMapping, RouteStore } from "./routes.js";
+import { withTailscaleLock } from "./tailscale-lock.js";
 import {
   ensureTailscaleReady,
   findAvailableServePort,
@@ -1508,7 +1509,8 @@ async function runApp(
     try {
       // Hold the Tailscale lock from recovery until this run's serve is recorded on its route, so
       // another process's recovery never finds the serve registered but not yet recorded (#280).
-      store.withTailscaleLock(() => {
+      store.ensureDir();
+      withTailscaleLock(store.dir, () => {
         // A session that died before cleaning up can leave its serve behind, which would push
         // this run to the next free port. Release those first.
         try {
@@ -2320,7 +2322,8 @@ ${colors.bold("Options:")}
   // A stale route is the only record of its Tailscale serve, so release that before removing
   // routes, and keep any route whose serve could not be released for the next prune (#280). The
   // Tailscale lock keeps a shared run from registering between a check and its removal.
-  const { stale, liveRoutes, removed, keptCount } = store.withTailscaleLock(() => {
+  store.ensureDir();
+  const { stale, liveRoutes, removed, keptCount } = withTailscaleLock(store.dir, () => {
     const stale = store.staleRoutes();
     const liveRoutes = store.loadRoutes();
     const released: RouteMapping[] = [];
