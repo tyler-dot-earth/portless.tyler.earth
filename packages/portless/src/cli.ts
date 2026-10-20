@@ -29,7 +29,9 @@ import { withTailscaleLock } from "./tailscale-lock.js";
 import {
   ensureTailscaleReady,
   findAvailableServePort,
+  findTailnetListener,
   formatTailscaleUrl,
+  getTailnetAddresses,
   getUsedServePorts,
   registerFunnel,
   registerServe,
@@ -1471,7 +1473,24 @@ async function runApp(
         const maxAttempts = 3;
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const usedPorts = getUsedServePorts();
-          const httpsPort = findAvailableServePort(usedPorts, wantsFunnel ? "funnel" : "serve");
+          // Another program listening on this node's tailnet address takes its traffic before
+          // Tailscale Serve can, so a port it holds would publish a URL that reaches that program.
+          const tailnetAddresses = getTailnetAddresses();
+          const isTaken = (candidate: number): boolean => {
+            const address = findTailnetListener(tailnetAddresses, candidate);
+            if (address === undefined) return false;
+            console.log(
+              colors.dim(
+                `  Skipped Tailscale port ${candidate}: another program listens on ${address}.`
+              )
+            );
+            return true;
+          };
+          const httpsPort = findAvailableServePort(
+            usedPorts,
+            wantsFunnel ? "funnel" : "serve",
+            isTaken
+          );
           try {
             if (wantsFunnel) {
               registerFunnel(port, httpsPort);

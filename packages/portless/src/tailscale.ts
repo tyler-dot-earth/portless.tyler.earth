@@ -288,18 +288,90 @@ export function servesLocalPort(
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// Ports another program holds on this node's tailnet address
+// ---------------------------------------------------------------------------
+
+/**
+ * A program listening on this node's own tailnet address gets the connections for that port
+ * before Tailscale Serve can, so a Serve registered there publishes a URL that reaches that
+ * program instead of the app.
+ */
+export type TailnetPortState = "listening" | "closed";
+export type TailnetPortProbe = (address: string, port: number) => TailnetPortState;
+
+const TAILNET_PROBE_TIMEOUT_MS = 1_000;
+const TAILNET_PROBE_LISTENING = 0;
+const TAILNET_PROBE_CLOSED = 1;
+/**
+ * Port allocation is synchronous, so the probe runs in a child `node`. Only a refused connection
+ * means closed; anything else is reported, never taken as a free port.
+ */
+const TAILNET_PROBE = [
+  'const socket = require("net").connect({ host: process.argv[1], port: Number(process.argv[2]) });',
+  "socket.setTimeout(Number(process.argv[3]));",
+  `socket.once("connect", () => process.exit(${TAILNET_PROBE_LISTENING}));`,
+  'socket.once("timeout", () => { process.stderr.write("timed out"); process.exit(2); });',
+  `socket.once("error", (error) => { if (error.code === "ECONNREFUSED") process.exit(${TAILNET_PROBE_CLOSED}); process.stderr.write(String(error.code ?? error.message)); process.exit(2); });`,
+].join(" ");
+
+/** This node's tailnet addresses, which must be known before any port can be called free. */
+export function getTailnetAddresses(runner: TailscaleCommandRunner = defaultRunner): string[] {
+  const result = runOrThrow(["ip"], "read this node's Tailscale addresses", runner);
+  const addresses = result.stdout.split(/\s+/).filter((address) => address.length > 0);
+  if (addresses.length === 0) {
+    throw new Error(
+      "`tailscale ip` listed no addresses for this node, so portless can't check which Tailscale ports are free. Is Tailscale connected?"
+    );
+  }
+  return addresses;
+}
+
+/** Whether a program accepts connections on `port` at `address`; throws when it can't tell. */
+export function probeTailnetPort(address: string, port: number): TailnetPortState {
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", TAILNET_PROBE, address, String(port), String(TAILNET_PROBE_TIMEOUT_MS)],
+    {
+      encoding: "utf-8",
+      stdio: ["ignore", "ignore", "pipe"],
+      timeout: TAILNET_PROBE_TIMEOUT_MS * 2,
+    }
+  );
+  if (probe.status === TAILNET_PROBE_LISTENING) return "listening";
+  if (probe.status === TAILNET_PROBE_CLOSED) return "closed";
+  const reason =
+    probe.error?.message ??
+    (probe.signal
+      ? `the probe was killed by ${probe.signal}`
+      : normalizeSpace(probe.stderr ?? "") || `the probe exited with ${probe.status}`);
+  throw new Error(
+    `Could not tell whether Tailscale port ${port} is free on ${address}: ${reason}.`
+  );
+}
+
+/** The first of `addresses` where another program already listens on `port`, if any. */
+export function findTailnetListener(
+  addresses: string[],
+  port: number,
+  probe: TailnetPortProbe = probeTailnetPort
+): string | undefined {
+  return addresses.find((address) => probe(address, port) === "listening");
+}
+
 /**
  * Pick the next available HTTPS port from the preferred sequence.
- * Returns the first port not in `usedPorts`. Funnel mode is restricted
- * to 443, 8443, and 10000; serve mode extends beyond its preferred list.
+ * Returns the first port not in `usedPorts` that `isTaken` doesn't claim. Funnel mode is
+ * restricted to 443, 8443, and 10000; serve mode extends beyond its preferred list.
  */
 export function findAvailableServePort(
   usedPorts: Set<number>,
-  mode: TailscaleMode = "serve"
+  mode: TailscaleMode = "serve",
+  isTaken: (port: number) => boolean = () => false
 ): number {
   const pool = mode === "funnel" ? FUNNEL_PORTS : PREFERRED_SERVE_PORTS;
   for (const port of pool) {
-    if (!usedPorts.has(port)) return port;
+    if (!usedPorts.has(port) && !isTaken(port)) return port;
   }
   if (mode === "funnel") {
     throw new Error(
@@ -308,7 +380,7 @@ export function findAvailableServePort(
     );
   }
   let port = PREFERRED_SERVE_PORTS[PREFERRED_SERVE_PORTS.length - 1] + 1;
-  while (usedPorts.has(port)) port++;
+  while (usedPorts.has(port) || isTaken(port)) port++;
   return port;
 }
 

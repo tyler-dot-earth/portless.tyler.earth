@@ -1,9 +1,13 @@
-import { describe, it, expect } from "vitest";
+import { createServer, type Server } from "node:net";
+import { afterEach, describe, it, expect } from "vitest";
 import {
   ensureTailscaleReady,
   findAvailableServePort,
+  findTailnetListener,
   formatTailscaleUrl,
+  getTailnetAddresses,
   getUsedServePorts,
+  probeTailnetPort,
   servesLocalPort,
   registerFunnel,
   registerServe,
@@ -344,6 +348,103 @@ describe("tailscale", () => {
       expect(() => findAvailableServePort(new Set([443, 8443, 10000]), "funnel")).toThrow(
         "All Tailscale Funnel ports are in use"
       );
+    });
+
+    it("skips a port another program already holds", () => {
+      expect(findAvailableServePort(new Set(), "serve", (port) => port === 443)).toBe(8443);
+      expect(findAvailableServePort(new Set([443]), "serve", (port) => port === 8443)).toBe(8444);
+    });
+
+    it("skips held ports beyond the preferred list", () => {
+      const all = new Set([443, 8443, 8444, 8445, 8446, 8447, 8448, 8449, 8450]);
+      expect(findAvailableServePort(all, "serve", (port) => port === 8451)).toBe(8452);
+    });
+
+    it("skips a held funnel port, and throws when the rest are taken", () => {
+      expect(findAvailableServePort(new Set(), "funnel", (port) => port === 443)).toBe(8443);
+      expect(() =>
+        findAvailableServePort(new Set([8443, 10000]), "funnel", (port) => port === 443)
+      ).toThrow("All Tailscale Funnel ports are in use");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Ports another program holds on this node's tailnet address
+  // -----------------------------------------------------------------------
+
+  describe("getTailnetAddresses", () => {
+    it("lists every address tailscale reports", () => {
+      const runner = createRunner({
+        ip: { stdout: "100.64.0.1\nfd7a:115c:a1e0::1\n" },
+      });
+      expect(getTailnetAddresses(runner)).toEqual(["100.64.0.1", "fd7a:115c:a1e0::1"]);
+    });
+
+    it("refuses to go on without an address to check", () => {
+      const runner = createRunner({ ip: { stdout: "\n" } });
+      expect(() => getTailnetAddresses(runner)).toThrow(
+        "`tailscale ip` listed no addresses for this node"
+      );
+    });
+
+    it("refuses to go on when tailscale can't list them", () => {
+      const runner = createRunner({ ip: { status: 1, stderr: "not logged in" } });
+      expect(() => getTailnetAddresses(runner)).toThrow("not logged in");
+    });
+  });
+
+  describe("probeTailnetPort", () => {
+    const servers: Server[] = [];
+    afterEach(async () => {
+      await Promise.all(
+        servers.splice(0).map((server) => new Promise((resolve) => server.close(resolve)))
+      );
+    });
+
+    async function listen(): Promise<{ server: Server; port: number }> {
+      const server = createServer();
+      servers.push(server);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("No TCP address");
+      return { server, port: address.port };
+    }
+
+    it("finds a program listening on the port", async () => {
+      const { port } = await listen();
+      expect(probeTailnetPort("127.0.0.1", port)).toBe("listening");
+    });
+
+    it("finds a port nothing listens on closed", async () => {
+      const { server, port } = await listen();
+      await new Promise((resolve) => server.close(resolve));
+      expect(probeTailnetPort("127.0.0.1", port)).toBe("closed");
+    });
+
+    it("throws rather than call a port free when the address doesn't answer", () => {
+      // 192.0.2.1 is TEST-NET-1: never assigned, so a connection can only fail or time out.
+      expect(() => probeTailnetPort("192.0.2.1", 443)).toThrow(
+        "Could not tell whether Tailscale port 443 is free on 192.0.2.1"
+      );
+    });
+  });
+
+  describe("findTailnetListener", () => {
+    it("names the first address where a program listens", () => {
+      const listening = new Set(["fd7a:115c:a1e0::1"]);
+      const probe = (address: string): "listening" | "closed" =>
+        listening.has(address) ? "listening" : "closed";
+      expect(findTailnetListener(["100.64.0.1", "fd7a:115c:a1e0::1"], 443, probe)).toBe(
+        "fd7a:115c:a1e0::1"
+      );
+      expect(findTailnetListener(["100.64.0.1"], 443, probe)).toBeUndefined();
+    });
+
+    it("lets a probe's failure stop the search", () => {
+      const probe = (): "listening" | "closed" => {
+        throw new Error("Could not tell");
+      };
+      expect(() => findTailnetListener(["100.64.0.1"], 443, probe)).toThrow("Could not tell");
     });
   });
 
